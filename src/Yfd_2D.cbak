@@ -1,0 +1,4447 @@
+
+  /* File   Yfd.c */
+#include "Yproto.h"
+#include <assert.h>
+
+/*
+ * 功能：用解析解公式（式9.15）更新R值
+ * 输入参数：
+ *   R_old        - 上一步的R值（初始正常屈服比R0）
+ *   eps_p_old    - 上一步的累积塑性应变（ε^p_0）
+ *   eps_p_new    - 当前步的累积塑性应变（ε^p_new）
+ *   Re           - 塑性启动阈值（与U(R)函数一致）
+ *   u            - 材料参数（与U(R)函数一致）
+ *   eps_xi       - 奇点防护参数（与U(R)函数的eps_xi完全一致，如1e-9）
+ *   tol          - 数值容差（默认1e-16）
+ * 返回值：
+ *   R_new        - 解析解计算的当前R值
+ */
+static inline double update_R_analytical(double R_old,
+                                         double eps_p_old,
+                                         double eps_p_new,
+                                         double Re,
+                                         double u,
+                                         double eps_xi,
+                                         double tol)
+{
+    // 1. 步骤1：处理初始R0（按文档规则：R0 < Re时设为Re）
+     
+    if (R_old < Re - tol) {  // 数值容差避免浮点误差误判
+        R_old = Re;
+    }
+
+    // 2. 步骤2：计算分母(1-Re)，沿用你U(R)中的非零检查
+    double denom = 1.0 - Re;
+    assert(denom > 1e-16 && "denom = 1-Re 接近0，会导致数值爆炸");
+
+    // 3. 步骤3：计算初始角度theta0 = π/2*(R0-Re)/(1-Re)，加入奇点防护
+    double theta0;
+    if (fabs(R_old - Re) < eps_xi) {
+        // R0≈Re时，避免角度接近0导致cos(theta0)精度问题（与你U(R)的xi_eff=eps_xi逻辑一致）
+        theta0 = 0.5 * MYPI * eps_xi;
+    } else {
+        double xi0 = (R_old - Re) / denom;
+        // 防护xi0异常（避免R0过大导致角度溢出）
+        xi0 = fmin(xi0, 1.0 + eps_xi);  // 参考你U(R)的xi_max_over逻辑
+        theta0 = 0.5 * MYPI * xi0;
+    }
+
+    // 4. 步骤4：计算指数项 exp(-πuΔε^p/(2(1-Re)))
+    double delta_eps_p = eps_p_new - eps_p_old;
+    double exp_arg = -0.5 * MYPI * u * delta_eps_p / denom;
+    // 指数项数值防护：避免下溢为0或上溢（工程场景合理范围）
+    exp_arg = fmax(exp_arg, -709.0);  // exp(-709)≈0，避免下溢
+    exp_arg = fmin(exp_arg, 709.0);   // exp(709)≈DBL_MAX，避免上溢
+    double exp_term = exp(exp_arg);
+
+    // 5. 步骤5：计算cos_arg = cos(theta0) * exp_term，防护acos输入范围
+    double cos_theta0 = cos(theta0);
+    // 参考你U(R)的sin防护，避免cos(theta0)数值波动
+    cos_theta0 = fmax(fmin(cos_theta0, 1.0 - tol), -1.0 + tol);
+    double cos_arg = cos_theta0 * exp_term;
+    // 强制限制cos_arg在[-1,1]内（acos输入必须满足）
+    cos_arg = fmax(fmin(cos_arg, 1.0), -1.0);
+
+    // 6. 步骤6：计算arccos项，代入解析解公式
+    double acos_term = acos(cos_arg);
+    double R_new = (2.0 / MYPI) * denom * acos_term + Re;
+
+    // 7. 步骤7：数值防护（确保R_new物理意义合理，与你U(R)的U_cap逻辑呼应）
+    R_new = fmax(R_new, Re - tol);          // 不小于Re（无塑性启动阈值以下）
+    R_new = fmin(R_new, 1.0 + 0.1);         // 参考你U(R)的xi_max_over，限制超屈服范围
+    return R_new;
+}
+
+
+
+/* Apply tangent of Sk = Ck (I - Cks^{-1}) to a 2D+33 perturbation Z.
+   Inputs:
+     Cks_inv2  : 2x2 block of Cks^{-1}
+     Cks_inv33 : scalar (33 component) of Cks^{-1}
+     Z2        : 2x2 perturbation (delta Cks in-plane)
+     Z33       : scalar perturbation (delta Cks 33)
+     Ck_scale  : scalar coefficient (e.g., Ck or Ck * Je^{-mk} if you ever add modulation)
+   Outputs:
+     dSk2      : 2x2 result = (Ck_scale) * (Cks_inv2 * Z2 * Cks_inv2)
+     dSk33     : scalar result = (Ck_scale) * (Cks_inv33 * Z33 * Cks_inv33)
+*/
+static inline void apply_Ck_tangent_on_Z(
+    const double Cks_inv2[2][2], double Cks_inv33,
+    const double Z2[2][2], double Z33,
+    double Ck_scale,
+    double dSk2[2][2], double *dSk33)
+{
+    int i,j,k;
+
+    /* Step 0: symmetrize Z2 */
+    double Zsym[2][2];
+    for (i=0;i<2;i++){
+        for (j=0;j<2;j++){
+            Zsym[i][j] = 0.5 * (Z2[i][j] + Z2[j][i]);
+        }
+    }
+    /* temp = Cks_inv2 * Zsym */
+    double temp[2][2] = {{0,0},{0,0}};
+    for (i=0;i<2;i++){
+        for (j=0;j<2;j++){
+            temp[i][j] = 0.0;
+            for (k=0;k<2;k++){
+                temp[i][j] += Cks_inv2[i][k] * Zsym[k][j];
+            }
+        }
+    }
+    /* dSk2 = Ck_scale * temp * Cks_inv2 */
+    for (i=0;i<2;i++){
+        for (j=0;j<2;j++){
+            double s = 0.0;
+            for (k=0;k<2;k++){
+                s += temp[i][k] * Cks_inv2[k][j];
+            }
+            dSk2[i][j] = Ck_scale * s;
+        }
+    }
+    /* 33 component: dSk33 = Ck_scale * (Cks_inv33 * Z33 * Cks_inv33) */
+    *dSk33 = Ck_scale * (Cks_inv33 * Z33 * Cks_inv33);
+}
+
+
+
+
+static inline void apply_Le_iso_plane_strain(const double E[2][2],   // 输入：应变张量（或应变率/增量）
+                                            double T[2][2],         // 输出：对应的弹性应力（或应力率/增量）
+                                            double Emod,            // Young's modulus E
+                                            double nu)              // Poisson's ratio ν
+{
+    // 预计算公共系数（与原始代码完全一致）
+    double coeff = Emod / ((1.0 + nu) * (1.0 - 2.0 * nu));   // ≡ dpeem / ((1+dpenu)*(1-2*dpenu))
+
+    // 正应力分量（对角项）
+    T[0][0] = coeff * ((1.0 - nu) * E[0][0] + nu * E[1][1]);
+    T[1][1] = coeff * ((1.0 - nu) * E[1][1] + nu * E[0][0]);
+
+    // 剪切分量
+    T[0][1] = (Emod / (1.0 + nu)) * E[0][1];   // ≡ 2G * E[0][1]，因为 E[0][1] = γ_xy / 2
+    T[1][0] = T[0][1];                        // 对称
+}
+
+
+
+
+
+
+
+/* Y = Le : Z （各向同性切线；Ktan/Gtan 是当前切线体积/剪切模量）*/
+
+/* Z：2x2，Z33：标量；Y 输出 2x2，*Y33 输出 scalar */
+/* Le 映射： Y -> W (same signature) */
+
+
+static inline void apply_Le_iso1(const double Z[2][2], double Z33,
+                                double W[2][2], double *W33,
+                                double Ktan, double Gtan)
+{
+    const double trZ = Z[0][0] + Z[1][1] + Z33;
+    
+    // 预先计算体积压力项 p = K * tr(epsilon)
+    // 注意：不要乘 1/3，也不要混淆球张量
+    const double press = Ktan * trZ; 
+
+    for (int i=0;i<2;++i){
+        for (int j=0;j<2;++j){
+            const double Iij = (i==j) ? 1.0 : 0.0;
+            // 偏应变 e_ij = ε_ij - 1/3 tr(ε) δ_ij
+            const double dev_strain = Z[i][j] - (trZ/3.0) * Iij;
+            
+            // σ_ij = p δ_ij + 2G e_ij
+            W[i][j] = press * Iij + 2.0 * Gtan * dev_strain;
+        }
+    }
+    
+    /* 33 分量 */
+    double dev_strain_33 = Z33 - (trZ/3.0);
+    *W33 = press + 2.0 * Gtan * dev_strain_33;
+}
+
+
+
+static inline void apply_Le_full_plane_strain(const double Z[2][2], double Z33,
+                                              double Y[2][2], double *Y33,
+                                              const double Ce[2][2], double Ce33,
+                                              const double S[2][2], double S33,
+                                              double K, double G)
+{
+    /* 1️⃣ 先构造平面内的 Ce_iso : Z（各向同性部分） */
+    double tmp[2][2];
+    double tmp33;
+    apply_Le_iso1(Z, Z33, tmp, &tmp33, K, G);   // tmp = Ce_iso : Z, tmp33 对应 33 分量
+
+    /* 2️⃣ Ce : tmp （Ce 是平面张量，扩展成 3×3 各向同性的有效体积映射） */
+    double Ce_tmp[2][2];
+    for(int i=0;i<2;++i){
+        for(int j=0;j<2;++j){
+            Ce_tmp[i][j] = 0.0;
+            for(int k=0;k<2;++k){
+                Ce_tmp[i][j] += Ce[i][k] * tmp[k][j];
+            }
+        }
+    }
+    /* 33 分量用等效各向同性近似 */
+    double Ce_tmp33 = Ce33 * tmp33;
+
+    /* 3️⃣ Z*S 项 */
+    double ZS[2][2];
+    for(int i=0;i<2;++i){
+        for(int j=0;j<2;++j){
+            ZS[i][j] = 0.0;
+            for(int k=0;k<2;++k){
+                ZS[i][j] += S[i][k] * Z[k][j];
+            }
+        }
+    }
+    /* 33 分量 */
+    double ZS33 = Z33 * S33;
+
+    /* 4️⃣ 组合并输出 */
+    for(int i=0;i<2;++i){
+        for(int j=0;j<2;++j){
+            Y[i][j] = ZS[i][j] + 0.5 * Ce_tmp[i][j];
+        }
+    }
+    *Y33 = ZS33 + 0.5 * Ce_tmp33;
+}
+/* 各向同性 Modified Neo-Hookean 一致切线算子作用：
+   输入：
+     - Ce2[2][2], Ce33         ：右Cauchy-Green的2D子块与33分量
+     - Ce_inv2[2][2], Ce_inv33 ：对应的逆的子块与33分量
+     - J, lnJ, Jm23            ：不变量
+     - I1                      ：tr(C) = Ce11 + Ce22 + Ce33
+     - K                       ：体积模量（可是当前的切线体积模量；若常数则=初值K0）
+     - G                       ：剪切模量（同上，若常数则=μ）
+     - Z2[2][2], Z33           ：输入二阶张量（对称）及其33分量
+   输出：
+     - W2[2][2], *W33          ：Y = Le : Z 的作用结果（2D与33分量）
+*/
+ void apply_Le_MNH_iso_final(
+    const double Ce2[2][2], double Ce33,
+    const double Ce_inv2[2][2], double Ce_inv33,
+    double J, double Jm23,
+    double I1,
+    double K, double G,
+    const double Z2[2][2], double Z33,
+    double W2[2][2], double *W33)
+{
+    int i,j,k;
+
+    /* --- alpha = tr(C^{-1} Z) --- */
+    double alpha = 0.0;
+    alpha += Ce_inv2[0][0]*Z2[0][0] + Ce_inv2[0][1]*Z2[1][0]
+           + Ce_inv2[1][0]*Z2[0][1] + Ce_inv2[1][1]*Z2[1][1]
+           + Ce_inv33 * Z33;
+
+    /* --- beta = tr(Z) --- */
+    double beta_par = Z2[0][0] + Z2[1][1];
+    double beta_33  = Z33;
+    double beta_tot = beta_par + beta_33;
+
+    /* --- Ce^{-1} * Z * Ce^{-1} --- */
+    double tmp2[2][2] = {{0,0},{0,0}};
+    double Ce_invZCe_inv2[2][2] = {{0,0},{0,0}};
+    for (i=0;i<2;i++){
+      for (j=0;j<2;j++){
+        tmp2[i][j] = 0.0;
+        for (k=0;k<2;k++) tmp2[i][j] += Ce_inv2[i][k] * Z2[k][j];
+      }
+    }
+    for (i=0;i<2;i++){
+      for (j=0;j<2;j++){
+        Ce_invZCe_inv2[i][j] = 0.0;
+        for (k=0;k<2;k++) Ce_invZCe_inv2[i][j] += tmp2[i][k] * Ce_inv2[k][j];
+      }
+    }
+    double Delta33 = Ce_inv33 * Z33 * Ce_inv33;
+
+    /* =========================================================
+       ============ 修改部分：体积导数 (J - 1)^2 ===============
+       =========================================================
+       W_vol = (K/2)(J-1)^2
+       S_vol = K (J-1) J C^{-1}
+       dS_vol = K[ (dJ) J + (J-1)dJ ]C^{-1} + K(J-1)J(-Δ)
+       注意：dJ = 0.5 * J * alpha
+       ========================================================= */
+    double dJ = 0.5 * J * alpha;
+
+    double coeff_Ceinv_vol = K * (dJ * J + (J - 1) * dJ); /* 乘 C^{-1} */
+    double coeff_Delta_vol = -K * (J - 1) * J;            /* 乘 (-Δ)    */
+
+    /* =========================================================
+       偏部分（同原函数）: W_dev = (G/2)(J^{-2/3} I1 - 3)
+       偏部分: W_dev = (G/2)(J^{-2/3} I1 - 3)
+       S_dev = G J^{-2/3} I − (1/3) G J^{-2/3} I1 C^{-1}
+       dS_dev 的通道系数：
+         I:      - (1/3) G J^{-2/3} alpha
+         Z:      + G J^{-2/3}
+         C^{-1}: + (1/3) G J^{-2/3} beta
+                 + (1/9) G J^{-2/3} I1 alpha   <-- 新增（修正）
+         Δ:      + (1/3) G J^{-2/3} I1         <-- 正号（修正）
+       ========================================================= */
+        double coeff_I       = G * ( - (1.0/3.0) * Jm23 * alpha );    /* 乘 I */
+    double coeff_Ceinv   = G * ( (1.0/3.0) * Jm23 * beta_tot );   /* 乘 C^{-1} (来自 dI1) */
+    double coeff_Z       = G * Jm23;                              /* 乘 Z */
+    double coeff_Delta   = + (1.0/3.0) * G * Jm23 * I1;           /* 乘 Δ   <-- 修正为正号 */
+
+    /* --- 初始化输出 --- */
+    W2[0][0]=W2[0][1]=W2[1][0]=W2[1][1]=0.0;
+    *W33 = 0.0;
+
+    /* --- 体积部分：C^{-1} 与 −Δ 项 --- */
+    for (i=0;i<2;i++)
+      for (j=0;j<2;j++)
+        W2[i][j] += coeff_Ceinv_vol * Ce_inv2[i][j];
+    *W33 += coeff_Ceinv_vol * Ce_inv33;
+
+    for (i=0;i<2;i++)
+      for (j=0;j<2;j++)
+        W2[i][j] += coeff_Delta_vol * (Ce_invZCe_inv2[i][j]);
+    *W33 += coeff_Delta_vol * (Delta33);
+
+    /* --- 偏：Z 项 --- */
+    for (i=0;i<2;i++)
+      for (j=0;j<2;j++)
+        W2[i][j] += coeff_Z * Z2[i][j];
+    *W33 += coeff_Z * Z33;
+
+    /* --- 偏：+(1/3) I1 Δ 项 ---  <-- 修正为正号 */
+    for (i=0;i<2;i++)
+      for (j=0;j<2;j++)
+        W2[i][j] += coeff_Delta * Ce_invZCe_inv2[i][j];
+    *W33 += coeff_Delta * Delta33;
+
+    /* --- 偏：+(1/3) tr(Z) C^{-1} 项 --- */
+    for (i=0;i<2;i++)
+      for (j=0;j<2;j++)
+        W2[i][j] += coeff_Ceinv * Ce_inv2[i][j];
+    *W33 += coeff_Ceinv * Ce_inv33;
+
+    /* --- 偏：+(1/9) I1 alpha C^{-1} 项 ---  <-- 新增（d(J^{-2/3}) 对 C^{-1} 的贡献） */
+    double coeff_Ceinv_extra = (1.0/9.0) * G * Jm23 * I1 * alpha;
+    for (i=0;i<2;i++)
+      for (j=0;j<2;j++)
+        W2[i][j] += coeff_Ceinv_extra * Ce_inv2[i][j];
+    *W33 += coeff_Ceinv_extra * Ce_inv33;
+
+    /* --- 偏：−(1/3) alpha I 项 --- */
+    W2[0][0] += coeff_I;
+    W2[1][1] += coeff_I;
+    *W33     += coeff_I;
+
+    /* --- 对称化（可选） --- */
+    double tmp = 0.5*(W2[0][1] + W2[1][0]);
+    W2[0][1] = W2[1][0] = tmp;
+}
+static inline void apply_Lmandel_on_Z_sym(
+    const double Ce2[2][2], double Ce33,
+    const double Ce_inv2[2][2], double Ce_inv33,
+    double J, double Jm23, double I1,
+    double K, double G,
+    const double S2[2][2], double S33,
+    const double Z2[2][2], double Z33,
+    double Y2[2][2], double *Y33,int ncstep)
+{
+    int i,k;
+
+    double W2[2][2], W33;
+
+    /* Step 1: W = Le : Z */
+    apply_Le_MNH_iso_final(
+        Ce2, Ce33, Ce_inv2, Ce_inv33,
+        J, Jm23, I1,
+        K, G,
+        Z2, Z33,
+        W2, &W33);
+
+    /* Step 2: Ce * W  (C_{ik} * W_{kj}) */
+    double CW2[2][2];
+    for (i=0;i<2;i++){
+      for (int j=0;j<2;j++){
+        CW2[i][j] = 0.0;
+        for (k=0;k<2;k++) CW2[i][j] += Ce2[i][k] * W2[k][j];
+      }
+    }
+    double CW33 = Ce33 * W33;
+
+    /* Step 3: Z * S  (Z_{ik} * S_{kj}) */
+    double ZS2[2][2];
+    for (i=0;i<2;i++){
+      for (int j=0;j<2;j++){
+        ZS2[i][j] = 0.0;
+        for (k=0;k<2;k++) ZS2[i][j] += Z2[i][k] * S2[k][j];
+      }
+    }
+    double ZS33 = Z33 * S33;
+
+    /* Step 4: 合并 Y = Z*S + Ce*W  (注意：没有 0.5 因子) */
+    for (i=0;i<2;i++){
+      for (int j=0;j<2;j++){
+        Y2[i][j] = ZS2[i][j] + CW2[i][j];
+      }
+    }
+    *Y33 = ZS33 + CW33;
+
+    /* Step 5: 对称化（如果你确实想取对称部分；否则可以删除） */
+    double tmp = 0.5*(Y2[0][1] + Y2[1][0]);
+    Y2[0][1] = Y2[1][0] = tmp;
+}
+
+
+/* Frobenius 点乘 */
+static inline double dot4_22(const double A[2][2], const double B[2][2]){
+    return A[0][0]*B[0][0] + A[0][1]*B[0][1]
+         + A[1][0]*B[1][0] + A[1][1]*B[1][1];
+}
+
+
+/* U(R) = u * cot( (pi/2) * <R - Re> / (1 - Re) )
+   - Re: quasi-elastic threshold (NOT elastic-core Rc)
+   - R in [0, +inf) during numerics; function handles R<=Re and R>1
+*/
+static inline double U_of_R(double R, double Re, double u,
+                            double eps_xi,    /* e.g. 1e-9 */
+                            double U_cap)     /* e.g. 1e12 or NAN=不截断 */
+{
+    /* 1) 归一化 ξ = <R-Re>/(1-Re) ∈ [0, +inf)；并夹到 (0,1) 附近以避开奇点 */
+    double denom = 1.0 - Re;
+    assert(denom > 1e-16);
+    double xi = (R - Re);
+    if (xi < 0.0) xi = 0.0;                /* Macaulay bracket */
+    xi /= denom;
+   double xi_eff;
+    /* 2) 处理方法1避免 θ=0 或 =π 的 cot 奇异：把 ξ 夹在 (0,1) 内部 */
+    /* 物理上 ξ∈[0,1] 对应 R∈[Re,1]；R>1 时 ξ>1，cot 为负，数值上也需避开 ξ=1 的正好奇点 */
+    //const double xi_min = eps_xi;               /* ~1e-9 */
+    //const double xi_max = 1.0 - eps_xi;         /* ~1 - 1e-9 */
+
+    //if (xi <= 0.0) xi_eff = xi_min;
+    //else if (xi >= 1.0) xi_eff = xi_max;
+    //else xi_eff = xi;   // 必须加上
+    /* 2) 处理方法2允许超过1的回拉 */
+    if (xi <= 0.0) {
+        xi_eff = eps_xi; // avoid θ=0
+    } else if (xi < 1.0) {
+        xi_eff = xi;     // inside (0,1): positive cot
+    } else {
+        // R > 1 → xi > 1: keep sign negative but avoid xi=1 singularity and huge angles
+        const double xi_min_over = 1.0 + eps_xi;
+        const double xi_max_over = 1.0 + 0.1;//xi_cap默认0.1 发现 R 经常越界很多（>1.1），应先减小步长，而不是无限放大 xi_cap。
+        //如果回拉太弱，R 长时间停在 1.01–1.02 附近，可以适当增大 xi_cap。
+        //如果回拉太猛，导致 R 在 0.95–1.05 来回震荡，可以减小 xi_cap
+        
+        xi_eff = xi;
+        //if (xi_eff < xi_min_over) xi_eff = xi_min_over;
+        //if (xi_eff > xi_max_over) xi_eff = xi_max_over;
+    }
+
+
+
+    /* 3) 计算 U(R) */
+    double theta = 0.5 * MYPI * xi_eff;             /* θ ∈ (0, π/2) for R∈(Re,1) */
+    double s = sin(theta), c = cos(theta);
+    double U = u * (c / fmax(s, 1e-300));       /* cot = cos/sin */
+
+    /* 4) 可选幅值截断，避免数值爆炸（特别是 R≈Re 时） */
+    if (!isnan(U_cap)) {
+        if (U >  U_cap) U =  U_cap;
+        if (U < -U_cap) U = -U_cap;
+    }
+    return U;
+}
+
+static inline void apply_Cinv_sym(
+ const double Cinv[2][2], // ← 这里就是公式里的 C_s^{-1}
+    const double X[2][2],    // ← 这里就是公式里的 X
+    double coeff,            // ← 这里就是公式里的 C_eff
+    double Y[2][2])          // → 输出 Y = C_eff * sym(C_s^{-1} X C_s^{-1})
+{
+    double tmp[2][2], prod[2][2], S[2][2];
+    // tmp = Cinv * X
+    tmp[0][0]=Cinv[0][0]*X[0][0]+Cinv[0][1]*X[1][0];
+    tmp[0][1]=Cinv[0][0]*X[0][1]+Cinv[0][1]*X[1][1];
+    tmp[1][0]=Cinv[1][0]*X[0][0]+Cinv[1][1]*X[1][0];
+    tmp[1][1]=Cinv[1][0]*X[0][1]+Cinv[1][1]*X[1][1];
+    // prod = tmp * Cinv
+    prod[0][0]=tmp[0][0]*Cinv[0][0]+tmp[0][1]*Cinv[1][0];
+    prod[0][1]=tmp[0][0]*Cinv[0][1]+tmp[0][1]*Cinv[1][1];
+    prod[1][0]=tmp[1][0]*Cinv[0][0]+tmp[1][1]*Cinv[1][0];
+    prod[1][1]=tmp[1][0]*Cinv[0][1]+tmp[1][1]*Cinv[1][1];
+    // 对称化
+    YSYMMAT2(prod, S);
+    // 乘系数
+    Y[0][0]=coeff*S[0][0]; Y[0][1]=coeff*S[0][1];
+    Y[1][0]=coeff*S[1][0]; Y[1][1]=coeff*S[1][1];
+}
+
+
+
+/* 推进 F_new = exp(dt * L_eff) * F_old */
+static inline void push_Fp_expmap(const double L_eff[2][2],
+                                  const double F_old[2][2],
+                                  double dt,
+                                  double F_new[2][2])
+{
+    double E[2][2];
+    YMATEXPM2(L_eff, dt, E); // E = exp(dt * L_eff)
+    YMATMUL2(E, F_old, F_new);
+}
+
+
+
+
+/* 
+   out = A + coeff * (B*C - C*B)
+   所有矩阵都是 2×2
+*/
+static inline void mat_submul(const double A[2][2],
+                               const double B[2][2],
+                               const double C[2][2],
+                               double coeff,
+                               double out[2][2])
+{
+    double BC[2][2], CB[2][2];
+
+    /* BC = B*C */
+    BC[0][0] = B[0][0]*C[0][0] + B[0][1]*C[1][0];
+    BC[0][1] = B[0][0]*C[0][1] + B[0][1]*C[1][1];
+    BC[1][0] = B[1][0]*C[0][0] + B[1][1]*C[1][0];
+    BC[1][1] = B[1][0]*C[0][1] + B[1][1]*C[1][1];
+
+    /* CB = C*B */
+    CB[0][0] = C[0][0]*B[0][0] + C[0][1]*B[1][0];
+    CB[0][1] = C[0][0]*B[0][1] + C[0][1]*B[1][1];
+    CB[1][0] = C[1][0]*B[0][0] + C[1][1]*B[1][0];
+    CB[1][1] = C[1][0]*B[0][1] + C[1][1]*B[1][1];
+
+    /* out = A + coeff * (BC - CB) */
+    out[0][0] = A[0][0] + coeff * (BC[0][0] - CB[0][0]);
+    out[0][1] = A[0][1] + coeff * (BC[0][1] - CB[0][1]);
+    out[1][0] = A[1][0] + coeff * (BC[1][0] - CB[1][0]);
+    out[1][1] = A[1][1] + coeff * (BC[1][1] - CB[1][1]);
+}
+
+
+
+
+
+
+
+
+static void  Yfd2TRIELS_EP(  
+             YINT    nelem,           
+    YINT    iprop,        
+    YINT    npnfact, YINT mprop, YINT nprop,
+    DBL   ***d3pnfac,
+    YINT    i1ptyp,
+    DBL     dpeks, DBL dpela, DBL dpemu, DBL dpero, DBL d1psem,
+    DBL     dpeem, DBL dpenu,
+    DBL   *d1nccx, DBL *d1nccy,
+    DBL   *d1ncix, DBL *d1nciy,
+    DBL   *d1nfcx, DBL *d1nfcy,
+    DBL    *d1nmct,
+    DBL   *d1nvcx, DBL *d1nvcy,
+    DBL    *d1pnaf, DBL *d1pnap, DBL *d1pnat,
+    YINT   *i1elpr, YINT *i1nopr, YINT **i2elto,
+    YINT    nohys, DBL dohyp, DBL dctime,DBL dcstec,
+    DBL    *d1ohys, DBL *d1ohyt, DBL *d1ohyx, DBL *d1ohyy,
+    YINT   *i1ohyt, YINT npnset, DBL *d1elfr,
+    YINT    i1usan, DBL d1peex, DBL d1peey,
+    DBL     d1pemx, DBL d1pemy, DBL d1peg,
+    YINT    iuseis,
+    DBL     dcstxx, DBL dcstxy, DBL dcstyy,
+    DBL     dcsyxx, DBL dcsyxy, DBL dcsyyy, DBL dcsrfy,
+    YINT   *i1pnfx, YINT *i1pnfy,
+    YINT   *i1pexc, YINT *i1nowe, YINT iusehf,
+    YINT    nsbar,
+    DBL   **d2elstr,
+    /* -------- new: DP material params for finite strain + subloading -------- */
+    DBL     d1phi, DBL d1DPc, DBL d1sig_t, 
+    DBL     d1F0, DBL d1h1, DBL d1h2, DBL d1Hc,
+    DBL     d1Ck, DBL d1Cc,
+    DBL     d1bk, //DBL d1ck, DBL d1nk,
+    DBL     d1URu, DBL d1uc, DBL d1Re, DBL d1Chi,
+    DBL     d1nP, DBL d1n2,DBL d1nn,
+    YINT    i1use_ext_subloading,  /* 1=use Mc/Rc (extended subloading), 0=initial subloading */
+    YINT    i1use_kinhard,         /* 1=enable Mk/Fpkd branch, 0=disable */
+    /* ---------------- new: element state pointers (history variables) ---------------- */
+    /* multiplicative decomposition states (store only what’s necessary) */
+    DBL   **Fe00, DBL **Fe01, DBL **Fe10, DBL **Fe11,DBL **Fe33,
+    DBL   **Fp00, DBL **Fp01, DBL **Fp10, DBL **Fp11,DBL **Fp33,
+    DBL   **Fpkd00, DBL **Fpkd01, DBL **Fpkd10, DBL **Fpkd11,DBL **Fpkd33,
+    DBL   **Fpcd00, DBL **Fpcd01, DBL **Fpcd10, DBL **Fpcd11,DBL **Fpcd33,
+    /* Mandel-like tensors (symmetric, store 3 comps in 2D) */
+    DBL   **M00, DBL **M01, DBL **M10, DBL **M11, DBL **M33,
+    DBL   **Mk00, DBL **Mk01,  DBL **Mk11, DBL **Mk33,
+    DBL   **Mc00, DBL **Mc01,  DBL **Mc11, DBL **Mc33,
+    /* hardening scalars and diagnostics */
+    DBL   **H, DBL **R, DBL **Rci,
+    DBL   **detFp, DBL **eqp, DBL **EPS , YINT ncstep, 
+    DBL   **sigma00, DBL **sigma10, DBL **sigma11, DBL **sigma33,DBL *d1area,
+   
+    DBL   **ss00, DBL **ss01, DBL **ss10, DBL **ss11, DBL **ss33
+
+)
+
+{ YINT ielem, i, j, k, in, jn, kn, ihys,jnopr,knopr;
+DBL v0, v1, v2, rpx, rpy, r0x, r0y, r1x, r1y, r2x, r2y, stprev;
+/* 形变梯度及其分解 */
+DBL F0[2][2], FX[2][2], F0inv[2][2], FXinv[2][2], F[2][2];
+DBL LX[2][2], Lglob[2][2];
+DBL Feinv[2][2];DBL Fpinv[2][2];DBL Fpkdinv[2][2];DBL Fpcdinv[2][2];
+DBL detFeLoc;   DBL detFpLoc;   DBL detFpkdLoc;   DBL detFpcdLoc;
+DBL  Fe[2][2],Fp[2][2], Fpkd[2][2], Fpks[2][2], Fpcs[2][2],Fpcd[2][2];
+DBL Tinsitu[2][2]; 
+
+/* 应变、应力、流动方向 */
+DBL Ce[2][2],Cks[2][2], Ccs[2][2], N[2][2];
+DBL Mk[2][2], Mc[2][2];
+DBL Sk[2][2], Sc[2][2];
+DBL S[2][2], M[2][2];
+
+/* 速度梯度分解 */
+DBL D[2][2],Dm[2][2], Wm[2][2], Lmid[2][2];
+DBL Lp[2][2], Lp_kd[2][2], Lp_cd[2][2];
+
+/* 其他 */
+DBL  V[3];
+DBL tK[2][2], sig[2][2];
+DBL J;
+DBL nx, ny, voli, volc;
+
+
+    /* 载荷因子插值（保留原逻辑） */
+    if(d3pnfac!=DBL3NULL && d3pnfac[0][0][0] != -R1){
+        DBL **d2time=d3pnfac[0], **d2fact=d3pnfac[1];
+        for(j=0;j<npnset;j++){
+            for(i=1;i<npnfact;i++){
+                if(dctime>=d2time[j][i-1] && dctime<=d2time[j][i]){
+                    d1pnaf[j] = d2fact[j][i-1] - (d2fact[j][i-1]-d2fact[j][i])*
+                                ((dctime-d2time[j][i-1])/(d2time[j][i]-d2time[j][i-1]));
+                }
+            }
+        }
+    }
+
+    /* 元素循环（只处理属性为 iprop 的单元） */
+ for (ielem = 0; ielem < nelem; ++ielem) {
+     if(i1elpr[ielem]==iprop)
+    {
+/* 节点索引缓存 */
+    const YINT n0 = i2elto[0][ielem];
+    const YINT n1 = i2elto[1][ielem];
+    const YINT n2 = i2elto[2][ielem];
+        /* === (1) 构建 F0, FX（初始/当前构型边矩阵） ===
+            */
+    F0[0][0] = d1ncix[n1] - d1ncix[n0];
+    F0[1][0] = d1nciy[n1] - d1nciy[n0];
+    F0[0][1] = d1ncix[n2] - d1ncix[n0];
+    F0[1][1] = d1nciy[n2] - d1nciy[n0];
+
+    FX[0][0] = d1nccx[n1] - d1nccx[n0];
+    FX[1][0] = d1nccy[n1] - d1nccy[n0];
+    FX[0][1] = d1nccx[n2] - d1nccx[n0];
+    FX[1][1] = d1nccy[n2] - d1nccy[n0];
+    YMATINV2(F0, F0inv, voli);   /* 初始构型逆，返回 det(F0) */
+    YMATINV2(FX, FXinv, volc);   /* 当前构型逆，返回 det(FX) */
+    d1area[ielem]=volc/2;
+    assert(d1area[ielem]>1e-10);
+    YMATMUL2(FX, F0inv, F);      /* F = FX * F0^{-1}  —— 总形变梯度 ∂x/∂X */
+    DBL F33 =1.0;               /* 平面应变假设 F33=1 */
+    /* === (2) 欧拉速度梯度 l（当前构型） ===
+       LX = [v1-v0, v2-v0] */
+    LX[0][0] = d1nvcx[n1] - d1nvcx[n0];
+    LX[0][1] = d1nvcx[n2] - d1nvcx[n0];
+    LX[1][0] = d1nvcy[n1] - d1nvcy[n0];
+    LX[1][1] = d1nvcy[n2] - d1nvcy[n0];
+    YMATMUL2(LX, FXinv, Lglob);  /* l = LX * FX^{-1} —— 式(10)中的 l */
+
+
+      for(i=0;i<2;i++)
+      { for(j=0;j<2;j++)
+        {
+          D[i][j]=RP5*(Lglob[i][j]+Lglob[j][i]);     /* rate of deformation      */
+
+      } }
+
+/* === (3) 载入历史变量（NINT=1）=== */
+/* 只载入需要的：Fp（必需）；Fpkd/Fpcd（本步不参与 L 的 pull-back，可不取） */
+Fp[0][0] = Fp00[0][ielem]; Fp[0][1] = Fp01[0][ielem];
+Fp[1][0] = Fp10[0][ielem]; Fp[1][1] = Fp11[0][ielem];
+DBL FP33 = Fp33[0][ielem];
+YMATINV2(Fp, Fpinv, detFpLoc);
+assert(fabs(detFpLoc)>EPSILON);
+assert(fabs(detFpLoc)>1e-3);
+
+//Fe[0][0] = Fe00[0][ielem]; Fe[0][1] = Fe01[0][ielem];
+//Fe[1][0] = Fe10[0][ielem]; Fe[1][1] = Fe11[0][ielem];
+//DBL FE33 = Fe33[0][ielem];
+YMATMUL2(F, Fpinv, Fe);
+assert(fabs(FP33)  > EPSILON);
+DBL FE33 = F33/FP33;
+
+Fpkd[0][0] = Fpkd00[0][ielem]; Fpkd[0][1] = Fpkd01[0][ielem];
+Fpkd[1][0] = Fpkd10[0][ielem]; Fpkd[1][1] = Fpkd11[0][ielem];
+DBL FPKD33 = Fpkd33[0][ielem];
+YMATINV2(Fpkd, Fpkdinv, detFpkdLoc);
+assert(fabs(detFpkdLoc) > EPSILON);
+YMATMUL2(Fp, Fpkdinv, Fpks);
+DBL FPKS33 = FP33/FPKD33;
+
+
+
+Fpcd[0][0] = Fpcd00[0][ielem]; Fpcd[0][1] = Fpcd01[0][ielem];
+Fpcd[1][0] = Fpcd10[0][ielem]; Fpcd[1][1] = Fpcd11[0][ielem];
+DBL FPCD33 = Fpcd33[0][ielem];
+YMATINV2(Fpcd, Fpcdinv, detFpcdLoc);
+assert(fabs(detFpcdLoc) > EPSILON);
+YMATMUL2(Fp, Fpcdinv, Fpcs);
+DBL FPCS33 = FP33/FPCD33;
+    /* === (4) pull‑back 到中间构型（式(10)）分解 Lmid = D + W（式(13)） ===
+       L = Fe^{-1} * l * Fe */
+      
+    YMATINV2(Fe, Feinv, detFeLoc);
+    for (i = 0; i < 2; ++i) {
+        for (j = 0; j < 2; ++j) {
+            Lmid[i][j] = 0.0;
+            for (k = 0; k < 2; ++k) {
+                for (int r = 0; r < 2; ++r) {
+                    Lmid[i][j] += Feinv[i][k] * Lglob[k][r] * Fe[r][j];
+                }
+            }
+        }
+    }
+
+   DBL LMID33 = 0.0; /* 平面应变假设 L33=0 */
+    //Dm[0][0] = Lmid[0][0];
+    //Dm[1][1] = Lmid[1][1];
+    //Dm[0][1] = 0.5 * (Lmid[0][1] + Lmid[1][0]);
+    //Dm[1][0] = Dm[0][1];
+    //Wm[0][0] = 0.0;
+   // Wm[1][1] = 0.0;
+   // Wm[0][1] = 0.5 * (Lmid[0][1] - Lmid[1][0]);
+    //Wm[1][0] = -Wm[0][1];
+
+       /* === (5) 弹性应力（Ce, S, M） === */
+        for(i=0;i<2;i++){
+           for(j=0;j<2;j++){ 
+            Ce[i][j]=0.0; 
+            Cks[i][j] = 0.0;
+            Ccs[i][j] = 0.0;
+            for(k=0;k<2;k++) {
+            Ce[i][j]+=Fe[k][i]*Fe[k][j];
+            Cks[i][j] += Fpks[k][i]*Fpks[k][j];
+            Ccs[i][j] += Fpcs[k][i]*Fpcs[k][j];
+          }}
+        }
+
+
+
+// 岩石超弹性参数
+    DBL kappa  = 0.0;            // 体积模量
+    assert (fabs(1.0 + dpenu) > EPSILON && fabs(1.0 - 2.0 * dpenu) > EPSILON) ;
+    dpemu    = dpeem / (2.0 * (1.0 + dpenu)); // 剪切模量（第二拉梅常数）
+    dpela = dpeem * dpenu / ((1.0 + dpenu) * (1.0 - 2.0 * dpenu));// 第一拉梅常数
+    kappa  = dpeem / (3.0 * (1.0 - 2.0 * dpenu));// 体积模量
+
+
+
+
+
+  /* 2) Ce^{-1} */
+    double Ce_inv[2][2], detCeinv;
+    YMATINV2(Ce, Ce_inv, detCeinv);
+
+    double CE33 = FE33*FE33;
+    double Ce_inv33 = FP33*FP33;
+
+    double Cks_inv[2][2], detCksinv;
+    YMATINV2(Cks, Cks_inv, detCksinv);
+    double CKS33 = FPKS33*FPKS33;
+    assert(fabs(FPKD33)  > EPSILON);
+    assert(fabs(CKS33)  > EPSILON);
+    double Cks_inv33 = 1.0 /(CKS33);
+
+
+    double Ccs_inv[2][2], detCcsinv;
+    YMATINV2(Ccs, Ccs_inv, detCcsinv);
+    double CCS33 = FPCS33*FPCS33;
+    assert(fabs(FPCD33)  > EPSILON);
+    assert(fabs(CCS33)  > EPSILON);
+    double Ccs_inv33 = 1.0 /(CCS33);
+
+
+
+double detCe = (Ce[0][0]*Ce[1][1] - Ce[0][1]*Ce[1][0]) * CE33;
+double Je = sqrt(detCe);
+assert(fabs(Je)  > EPSILON);
+assert(detCe > EPSILON);
+    double lnJe = log(Je);
+
+  
+   
+    double I1 = Ce[0][0] + Ce[1][1] + CE33;
+    double Jm23 = pow(Je, -2.0/3.0);
+    double trCbar = Jm23 * I1;
+
+
+    double E[2][2];
+double B[2][2];
+      for(i=0;i<2;i++)
+      { for(j=0;j<2;j++)
+        { B[i][j]=R0;
+          for(k=0;k<2;k++)
+          { B[i][j]=B[i][j]+Fe[i][k]*Fe[j][k]; /* left Cauchy-Green strain */
+          }
+
+          E[i][j]=RP5*B[i][j];               /* small strain             */
+          if(i==j)E[i][j]=E[i][j]-RP5;
+      } }
+
+
+ double E33 = 0.0;
+
+
+
+    double nu = dpenu;
+    double Gtan = dpeem / (2.0 * (1.0 + nu));
+    double Ktan = dpeem / (3.0 * (1.0 - 2.0 * nu));
+
+    // 2. 定义Z[2x2]（对应小应变E）和Z33（平面应变约束推导）
+    double Z[2][2];
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < 2; ++j) {
+            Z[i][j] = E[i][j]; // Z对应原有小应变张量E
+        }
+    }
+    double trE = E[0][0] + E[1][1]; // 面内应变张量迹
+    //double Z33 = - (nu / (1.0 - nu)) * trE; // 平面应变下的33方向应变
+double Z33 =0.0; 
+    // 3. 定义输出变量W[2x2]（弹性应力）和W33（面外应力，可按需存储）
+    double W[2][2];
+    double W33;
+
+    // 4. 调用apply_Le_iso1计算弹性本构应力
+    apply_Le_iso1(Z, Z33, W, &W33, Ktan, Gtan);
+
+    // 5. 叠加率相关项（dpeks*D），得到最终应力T（与原有逻辑一致）
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < 2; ++j) {
+            S[i][j] = W[i][j] ;
+        }
+    }
+ double SS33 = W33;
+
+
+    YMATMUL2(Ce, S, M);
+    double M33 = CE33 * SS33;
+ //   */
+
+
+ 
+    double Iden[2][2];
+    YMATID2(Iden);  // 赋值为单位阵
+
+ 
+
+    /* 12) Sk = Ck (I − Cks^{-1})，Sc 类似 */
+    for (int a=0; a<2; ++a){
+        for (int b=0; b<2; ++b){
+            Sk[a][b] = d1Ck  * (Iden[a][b] - Cks_inv[a][b]);
+            Sc[a][b] = d1Cc  * (Iden[a][b] - Ccs_inv[a][b]);
+        }
+    }
+
+    /* 13) Mk = Ck (Cks − I)，Mc 类似 */
+    for (int a=0; a<2; ++a){
+        for (int b=0; b<2; ++b){
+            Mk[a][b]  = d1Ck * (Cks[a][b] - Iden[a][b]);
+            Mc[a][b] = d1Cc * (Ccs[a][b] - Iden[a][b]);
+        }
+    }
+double SK33 = d1Ck * (1.0 -  (Cks_inv33));
+double SC33 = d1Cc * (1.0 -  (Ccs_inv33));
+
+double MK33 = d1Ck * (CKS33 - 1.0);
+double MC33  = d1Cc * (CCS33 - 1.0);
+//double MK33 = 0.0, MC33 = 0.0; /* 若有核的33分量，填充它；否则留0 */
+
+
+
+
+
+
+
+
+
+
+
+/* === (6) DP with extended subloading (Section 8, Hashiguchi) === */
+
+/* 输入/历史：
+   - Mk00/Mk01/Mk11, Mc00/Mc01/Mc11 : (可选) 运动硬化/弹性核张量的分量（中间构型）
+   - R[0][ielem] : 当前次载面比 (0<=R<=1)，初始化可取 ~Re 或 0
+   - i1use_kinhard[ielem], i1use_ext_subloading[ielem] : 两个开关
+*/
+
+/* 6.0 构造有效 Mandel 应力 M_eff = M − R Mk − (1−R) Mc    或M_eff = M −  Mk  */
+double Meff[2][2] = { { M[0][0], M[0][1] }, { M[1][0], M[1][1] } };
+double M33_eff = M33;
+double Rn = R[0][ielem];                   /* 次载面比 */
+//Rn = fmin(1.0, fmax(0.0, Rn));             /* 夹紧到 [0,1] */
+/* 6.1  退化第7节M_eff = M −  Mk  */
+if (i1use_ext_subloading == 1 && i1use_kinhard == 0) {
+    Meff[0][0] -=  Mk[0][0];
+    Meff[0][1] -=  Mk[0][1];
+    Meff[1][0] -=  Mk[1][0];
+    Meff[1][1] -=  Mk[1][1];
+    M33_eff   -=  MK33;
+}
+
+/* 6.2 完整第8节M_eff = M − R Mk − (1−R) Mc */
+if (i1use_ext_subloading == 1 && i1use_kinhard == 1) {
+
+    Meff[0][0] = Meff[0][0]-Rn *Mk[0][0]-(1-Rn) * Mc[0][0];
+    Meff[0][1] = Meff[0][1]-Rn *Mk[0][1]-(1-Rn) * Mc[0][1];
+    Meff[1][0] = Meff[1][0]-Rn *Mk[1][0]-(1-Rn) * Mc[1][0];
+    Meff[1][1] = Meff[1][1]-Rn *Mk[1][1]-(1-Rn) * Mc[1][1];
+    M33_eff   = M33_eff  -Rn *MK33   -(1-Rn) * MC33;
+}
+
+/* 6.1 对称化 Meff           考虑各项异性的化就不应该对称  但是也不能用DP准则*/
+double Msym[2][2];double Msym33;
+Msym[0][0] = Meff[0][0];
+Msym[0][1] = Meff[0][1];
+Msym[1][0] = Meff[1][0];
+//Msym[0][1] = 0.5*(Meff[0][1] + Meff[1][0]);
+//Msym[1][0] = Msym[0][1];
+Msym[1][1] = Meff[1][1];
+Msym33 = M33_eff;
+/* 6.2 p,q, dev(Msym) 基于 Meff 计算 */
+double trMsym = Msym[0][0] + Msym[1][1]+ Msym33;
+double p   = -(1.0/3.0)*trMsym;
+
+
+double devMsym[2][2];
+double one_third_tr = trMsym/3.0;
+devMsym[0][0] = Msym[0][0] - one_third_tr;
+devMsym[0][1] = Msym[0][1];
+devMsym[1][0] = Msym[1][0];
+devMsym[1][1] = Msym[1][1] - one_third_tr;
+double dev33  = Msym33     - one_third_tr;
+double dev3 = devMsym[0][0]*devMsym[0][0]
+            + devMsym[0][1]*devMsym[0][1]
+            + devMsym[1][0]*devMsym[1][0]
+            + devMsym[1][1]*devMsym[1][1]
+            + dev33*dev33;
+
+double norm_devMsym = sqrt(dev3);
+double q = sqrt(1.5) * norm_devMsym;
+double dq_dM33 = (q > 1e-14) ? (3.0/(2.0*q)) * dev33 : 0.0;
+/* 6.3 DP 参数：alpha(φ) 与 k(c,H) */
+double phi_rad = d1phi * (MYPI/180.0); /* φ: 度 */
+double sinf = sin(phi_rad), cosf = cos(phi_rad);
+
+
+
+
+double Fhard = d1F0 + d1h1 * (1.0 - exp(-d1h2 * H[0][ielem])) + d1Hc * H[0][ielem];
+double c_eff = d1DPc + Fhard;
+
+//double alpha_y = (2.0*sinf) / (3.0 - sinf);
+//double k_y = (6.0 * c_eff * cosf) / (3.0 - sinf);
+double denom = sqrt(1.0 + (1.0/3.0)*sinf*sinf);
+double alpha_y = (sqrt(3.0)*sinf) / denom;
+double k_y     = (sqrt(3.0)*cosf*c_eff) / denom;
+
+double Nc_hat[2][2];    Nc_hat[0][0] = Nc_hat[0][1] = Nc_hat[1][0] = Nc_hat[1][1] = 0.0;
+
+/* 6.5 流动法向 N = ∂f/∂M（非关联：只在 N 中用 ψ） */
+double dP_dM[2][2] = { {-1.0/3.0, 0.0}, {0.0, -1.0/3.0} };
+double dp_dM33 = -1.0/3.0;
+double Rc = 1.0; // 默认值
+double Nc_hat33 = 0.0;
+if (i1use_kinhard == 1) {
+    // 1) 取 Mc 并对称化（各向同性屈服用）
+    double Mc_t[2][2] = {
+        { Mc[0][0]- Mk[0][0], Mc[0][1]- Mk[0][1] },
+        { Mc[1][0]- Mk[1][0], Mc[1][1]- Mk[1][1] }
+    };
+    double Mc_t33 = MC33- MK33;
+    double Mcsym[2][2];
+    Mcsym[0][0] = Mc_t[0][0];
+    Mcsym[0][1] = 0.5*(Mc_t[0][1] + Mc_t[1][0]);
+    Mcsym[1][0] = Mcsym[0][1];
+    Mcsym[1][1] = Mc_t[1][1];
+    double Mcsym33 = Mc_t33;
+    // 2) p_c, q_c
+    double trMc = Mcsym[0][0] + Mcsym[1][1]+Mcsym33;
+    double pc   = -(1.0/3.0)*trMc;
+    double one_third_trc = trMc/3.0;
+
+    double devMc00 = Mcsym[0][0] - one_third_trc;
+    double devMc01 = Mcsym[0][1];
+    double devMc10 = Mcsym[1][0];
+    double devMc11 = Mcsym[1][1] - one_third_trc;
+    double devMc33 = Mcsym33 - one_third_trc;
+    double devMc2 = devMc00*devMc00 + devMc01*devMc01
+                  + devMc10*devMc10 + devMc11*devMc11 + devMc33*devMc33;
+    double qc = sqrt(1.5) * sqrt(fmax(devMc2, 0.0));
+
+
+
+
+/* 4) DP 梯度：Gc = ∂q/∂M + α_c ∂p/∂M
+      其中 ∂q/∂M = (3/(2q)) devM，∂p/∂M = -I/3
+   角度选择：
+   - 关联：α_c = α_y（与屈服面一致）
+   - 非关联：α_c = 2 sinψ_c / (3 − sinψ_c)（如果你为弹性核选了不同的 ψ_c） */
+double alpha_c = alpha_y; // 关联；如需非关联，用你的 ψ_c 改这里
+    double d1psi_c =  10.0; // 非关联时的摩擦角，度
+    double psi_c_rad = d1psi_c * (MYPI/180.0);
+    double sinc = sin(psi_c_rad);
+    alpha_c = (2.0*sinc) / (3.0 - sinc);
+
+
+
+
+
+double Gc[2][2];
+if (qc > 1e-14) {
+    double coeff = 3.0/(2.0*qc);
+    Gc[0][0] = coeff*devMc00 + alpha_c*dP_dM[0][0];
+    Gc[0][1] = coeff*devMc01 + alpha_c*dP_dM[0][1];
+    Gc[1][0] = coeff*devMc10 + alpha_c*dP_dM[1][0];
+    Gc[1][1] = coeff*devMc11 + alpha_c*dP_dM[1][1];
+} else {
+    /* q_c 极小时只保留体积梯度，避免数值不稳 */
+    Gc[0][0] = alpha_c*dP_dM[0][0];
+    Gc[0][1] = alpha_c*dP_dM[0][1];
+    Gc[1][0] = alpha_c*dP_dM[1][0];
+    Gc[1][1] = alpha_c*dP_dM[1][1];
+}
+double Gc33 = (qc > 1e-14) ? (3.0/(2.0*qc)) * devMc33 + alpha_c * dp_dM33 : alpha_c * dp_dM33;
+
+
+
+double n3k = Gc[0][0]*Gc[0][0] + Gc[0][1]*Gc[0][1]
+          + Gc[1][0]*Gc[1][0] + Gc[1][1]*Gc[1][1]+ Gc33*Gc33;
+double nrm = sqrt(n3k);
+
+if (nrm > 1e-14) {
+    Nc_hat[0][0] = Gc[0][0] / nrm;
+    Nc_hat[0][1] = Gc[0][1] / nrm;
+    Nc_hat[1][0] = Gc[1][0] / nrm;
+    Nc_hat[1][1] = Gc[1][1] / nrm;
+    Nc_hat33 = Gc33 / nrm;
+} else {
+    Nc_hat[0][0] = Nc_hat[0][1] = Nc_hat[1][0] = Nc_hat[1][1] = Nc_hat33 = 0.0;
+}
+
+
+    // 3) Rc = (q_c + α p_c) / k(H)
+    double denom = fmax(k_y, 1e-16);
+    Rc = (qc + alpha_y * pc) / denom;
+
+    // 4) 夹紧到 [0,1]，可选再夹到 χ<1
+    if (isnan(Rc) || isinf(Rc)) Rc = 0.0;
+    Rc = fmin(1.0, fmax(0.0, Rc));
+    // 如果有极限弹性核比例 chi：
+     Rc = fmin(Rc, d1Chi);
+                      }
+
+
+
+
+/* 6.4 次载面缩放：f = q + α p − R·k */
+
+double f_val = q + alpha_y * p - (d1Re * k_y);
+
+Rn = R[0][ielem]; 
+if(f_val < 500){
+
+R[0][ielem] = (q + alpha_y * p )/( k_y);
+
+if((ncstep%1==0)&&(ielem==0)) { // 仅输出第一个单元第一个增量的信息
+  //if((ielem==0)) { // 仅输出第一个单元第一个增量的信息
+  printf("Rn = %.6e", R[0][ielem]);
+  printf("f_val,%.16e",  f_val);
+  printf("Time,%1d\n",  ncstep);
+
+};
+
+}
+else {
+    
+  
+
+double f_val_1 = q + alpha_y * p - (Rn * k_y);
+double alpha_g = alpha_y;
+
+
+/* 4) DP 梯度：Gc = ∂q/∂M + α_c ∂p/∂M
+      其中 ∂q/∂M = (3/(2q)) devM，∂p/∂M = -I/3
+   角度选择：
+   - 关联：α_c = α_y（与屈服面一致）
+   - 非关联：α_c = 2 sinψ_c / (3 − sinψ_c)（如果你为弹性核选了不同的 ψ_c） */
+//double d1psi = 10.0; // 非关联时的膨胀角，度
+  //  double psi_rad = d1psi * (MYPI/180.0);
+    //double sinp = sin(psi_rad);
+   // alpha_g = (2.0*sinp) / (3.0 - sinp);
+
+
+double G[2][2];
+double G33;
+/* ∂q/∂M = (3/(2q)) devM，当 q 很小时只保留体积项 */
+if (q > 1e-14) {
+    double coeff = 3.0/(2.0*q);
+    G[0][0] = coeff*devMsym[0][0] + alpha_g*dP_dM[0][0];
+    G[0][1] = coeff*devMsym[0][1] + alpha_g*dP_dM[0][1];
+    G[1][0] = coeff*devMsym[1][0] + alpha_g*dP_dM[1][0];
+    G[1][1] = coeff*devMsym[1][1] + alpha_g*dP_dM[1][1];
+     G33 = dq_dM33 + alpha_g * dp_dM33;
+} else {
+    G[0][0] = alpha_g*dP_dM[0][0];
+    G[0][1] = alpha_g*dP_dM[0][1];
+    G[1][0] = alpha_g*dP_dM[1][0];
+    G[1][1] = alpha_g*dP_dM[1][1];
+     G33    = alpha_g * dp_dM33;
+}
+
+
+/* 3) 单位化（Frobenius 范数）；若极小则置零避免数值噪声 */
+double NnormG = G[0][0]*G[0][0] + G[0][1]*G[0][1]
+              + G[1][0]*G[1][0] + G[1][1]*G[1][1];
+double Nnormg = sqrt(NnormG+ G33*G33);
+
+double NG[2][2];double NG33 ;
+if (Nnormg > 1e-14) {
+    NG[0][0] = G[0][0] / Nnormg;
+    NG[0][1] = G[0][1] / Nnormg;
+    NG[1][0] = G[1][0] / Nnormg;
+    NG[1][1] = G[1][1] / Nnormg;
+} else {
+    NG[0][0] = NG[0][1] = NG[1][0] = NG[1][1] = 0.0;
+}
+    NG33   = (Nnormg > 1e-14) ? (G33 / Nnormg) : 0.0;
+
+
+/* 2) 对称化 N = sym[G] */
+double Nsym[2][2];
+Nsym[0][0] = G[0][0];
+Nsym[1][1] = G[1][1];
+Nsym[0][1] = 0.5*(G[0][1] + G[1][0]);
+Nsym[1][0] = Nsym[0][1];
+double Nsym33 = G33;
+/* 3) 单位化（Frobenius 范数）；若极小则置零避免数值噪声 */
+double Nnorm2 = Nsym[0][0]*Nsym[0][0] + Nsym[0][1]*Nsym[0][1]
+              + Nsym[1][0]*Nsym[1][0] + Nsym[1][1]*Nsym[1][1]+ Nsym33*Nsym33;
+double Nnorm = sqrt(Nnorm2);
+double Ndir[2][2];double Ndir33;
+if (Nnorm > 1e-14) {
+    Ndir[0][0] = Nsym[0][0] / Nnorm;
+    Ndir[0][1] = Nsym[0][1] / Nnorm;
+    Ndir[1][0] = Nsym[1][0] / Nnorm;
+    Ndir[1][1] = Nsym[1][1] / Nnorm;
+} else {
+    Ndir[0][0] = Ndir[0][1] = Ndir[1][0] = Ndir[1][1] = 0.0;
+}
+
+    Ndir33   = (Nnorm > 1e-14) ? (Nsym33 / Nnorm) : 0.0;
+
+
+/* 备注：
+   - 后续塑性乘子 Δλ（或 ĖΛ）计算时，仍用这个 Ndir 与你的弹性切线/速度梯度组合。判断加卸载用NG
+   - 次载面 R 的更新放在“确认进入塑性”后，随 |D^p| 演化（见下文）。 */
+
+
+
+
+/* 1) 分子 num = N : Le : sym(Ce L) */
+double CeL[2][2] = {
+    { Ce[0][0]*Lmid[0][0] + Ce[0][1]*Lmid[1][0],  Ce[0][0]*Lmid[0][1] + Ce[0][1]*Lmid[1][1] },
+    { Ce[1][0]*Lmid[0][0] + Ce[1][1]*Lmid[1][0],  Ce[1][0]*Lmid[0][1] + Ce[1][1]*Lmid[1][1] }
+};
+double CeL33 = CE33 * LMID33;// 平面应变假设 LMID33=0 
+double Y[2][2];  // Y = sym(CeL)
+YSYMMAT2(CeL, Y);
+//double A    = trCbar;
+//double term = - dpemu * (A - 3.0) - (2.0/3.0) * A;
+double Y33 = 0.0; // 平面应变假设 CeL33=0
+double W[2][2];  // W = Le : Y
+double W33;
+
+apply_Le_full_plane_strain(  Y, Y33, 
+                                              W, &W33,
+                                              Ce, CE33,
+                                              S, SS33, 
+                                              kappa, dpemu);
+
+//apply_Le_iso(Y, W, kappa, dpemu);
+//double num = dot4_22(NG, W);
+/* 4) 点乘 num 要包含 33 项（NG33 可能 != 0,但是W33应该是0 因为平面应变假设 LMID33=0）   要测试  看看是不是   */
+double num = NG[0][0]*W[0][0] + NG[0][1]*W[0][1]
+           + NG[1][0]*W[1][0] + NG[1][1]*W[1][1]
+           + NG33 * W33;
+double dlambda_dot ;
+double U_R = 0.0;
+/* f_Hn：等效塑性应变定义 ⇒ sqrt(2/3) */
+const double fHn = sqrt(2.0/3.0);
+
+if (num <= 0.0) {
+    dlambda_dot = 0.0;
+     /* 卸载方向，直接跳到历史变量写回 */
+
+
+    }
+else {
+
+
+    /* 进入塑性，计算 Δλ */
+  
+if ( f_val_1<= 0.0) {
+ dlambda_dot = 0.0;
+//R[0][ielem] = (q + alpha_y * p )/( k_y);
+
+     /* 卸载方向，直接跳到历史变量写回 */
+}
+else {
+  if((ncstep%1000==0)&& (ielem==0))
+      { printf("p:%.10f,", p );
+        printf("q:%.10f,", q );
+        printf("f_val_1:%.10f,%1d\n", f_val_1, ncstep);
+  }
+
+
+
+/* Xk = N̄ − (1/bk) M̄_k */
+double Xk[2][2] = {
+    { Ndir[0][0] - (1.0/d1bk)*   Mk[0][0], Ndir[0][1] - (1.0/d1bk)*Mk[0][1] },
+    { Ndir[1][0] - (1.0/d1bk)*Mk[1][0], Ndir[1][1] - (1.0/d1bk)*Mk[1][1] }
+};
+double XK33 = Ndir33 - (1.0/d1bk)*MK33;
+/* Yk = F_{ks}^p C^k : F_{ks}^{pT} Xk F_{ks}^p F_{ks}^{pT} */
+
+// Step 1: 计算 Fpks^T
+double FpksT[2][2] = {
+    { Fpks[0][0], Fpks[1][0] },
+    { Fpks[0][1], Fpks[1][1] }
+};
+
+// Step 2: temp1 = FpksT * Xk
+double temp1[2][2];
+YMATMUL2(FpksT, Xk, temp1);  // temp1 = Fpks^T * Xk
+
+// Step 3: temp2 = temp1 * Fpks
+double temp2[2][2];
+YMATMUL2(temp1, Fpks, temp2);    // temp2 = Fpks^T * Xk * Fpks
+double temp2_33 = FPKS33*XK33*FPKS33;
+
+double temp3[2][2];
+double temp3_33;
+apply_Ck_tangent_on_Z(
+    Cks_inv,     // 2×2 block of Cks^{-1}
+    Cks_inv33,    // scalar 33 component
+    temp2,        // Z2 = Fpks^T * Xk * Fpks *
+    temp2_33,         // Z33
+    d1Ck,     // scaling factor for C^k
+    temp3,           // output: dSk2
+    &temp3_33         // output: dSk33
+);
+
+// Step 4: temp3 = temp3 * FpksT
+double temp4[2][2];
+YMATMUL2(temp3, FpksT, temp4);       // temp3 =  * Fpks^T
+double temp4_33 = temp3_33*FPKS33;
+
+double Yk[2][2];
+YMATMUL2(Fpks, temp4, Yk);       // Yk = Fpks * temp4
+double YK_33 =  FPKS33*temp4_33;
+
+
+
+/* Xc = N̄ − (Rc/χ) N̂_c */
+double Xc[2][2] = {
+    { Ndir[0][0] - (Rc/d1Chi)*Nc_hat[0][0], Ndir[0][1] - (Rc/d1Chi)*Nc_hat[0][1] },
+    { Ndir[1][0] - (Rc/d1Chi)*Nc_hat[1][0], Ndir[1][1] - (Rc/d1Chi)*Nc_hat[1][1] }
+};
+
+double XC33 = Ndir33 - (Rc/d1Chi)* Nc_hat33;
+/* Yc */
+
+// Step 1: 计算 Fpks^T
+double FpcsT[2][2] = {
+    { Fpcs[0][0], Fpcs[1][0] },
+    { Fpcs[0][1], Fpcs[1][1] }
+};
+
+// Step 2: temp5 = FpksT * Xc
+double temp5[2][2];
+YMATMUL2(FpcsT, Xc, temp5);  // temp5 = Fpcs^T * Xc
+
+// Step 3: temp6 = temp5 * Fpcs
+double temp6[2][2];
+YMATMUL2(temp5, Fpcs, temp6);    // temp6 = Fpcs^T * Xc * Fpcs
+double temp6_33 = FPCS33*XC33*FPCS33;
+
+double temp7[2][2];
+double temp7_33;
+apply_Ck_tangent_on_Z(
+    Ccs_inv,     // 2×2 block of Cks^{-1}
+    Ccs_inv33,    // scalar 33 component
+    temp6,        // Z2 = Fpcs^T * Xc * Fpcs
+    temp6_33,         // Z33
+    d1Cc,     // scaling factor for C^k
+    temp7,           // output: dSk2
+    &temp7_33         // output: dSk33
+);
+
+// Step 4: temp7 = temp6 * FpcsT
+double temp8[2][2];
+YMATMUL2(temp7, FpcsT, temp8);       // temp3 =  * Fpcs^T
+double temp8_33 = temp7_33*FPCS33;
+
+double Yc[2][2];
+YMATMUL2(Fpcs, temp8, Yc);       // Yc = Fpcs * temp8
+double YC_33 =  FPCS33*temp8_33;
+
+
+  
+  /* 输入：phi, H, d1h1, d1h2, d1Hc, d1DPc, d1F0 等；你已有的 q/p/k 之前计算 */
+double phi_rad = d1phi * (MYPI/180.0);
+double sinf = sin(phi_rad), cosf = cos(phi_rad);
+
+/* c_eff(H) */
+double Fhard = d1F0 + d1h1 * (1.0 - exp(-d1h2 * H[0][ielem])) + d1Hc * H[0][ielem];
+double c_eff = d1DPc + Fhard;
+
+/* k(H) = F(H) */
+double k_val = (6.0 * cosf / (3.0 - sinf)) * c_eff;
+
+/* F' = dk/dH = Cφ * dc_eff/dH；但用在 coeff_iso = (F' f_Hn)/F 时会抵消 Cφ */
+double dc_dH = d1h1 * d1h2 * exp(-d1h2 * H[0][ielem]) + d1Hc;
+
+
+
+/* coeff_iso = (F' f_Hn)/F = (dc_eff/dH * fHn)/c_eff */
+double coeff_iso = 0.0;
+if (c_eff > 1e-16) coeff_iso = (dc_dH * fHn) / c_eff;
+  
+  /* term_a = coeff_iso * Mbar （用中间构型的 Mandel 应力）*/
+double term_a[2][2] = {
+    { coeff_iso * Meff[0][0], coeff_iso * Meff[0][1] },
+    { coeff_iso * Meff[1][0], coeff_iso * Meff[1][1] }
+};
+  double term_a33 = coeff_iso * M33_eff;
+    double M__[2][2] = {
+        { M[0][0]- Mc[0][0], M[0][1]- Mc[0][1] },
+        { M[1][0]- Mc[1][0], M[1][1]- Mc[1][1] }
+    };
+  double M__33 = M33 - MC33;
+
+
+d1URu=d1URu*exp(d1uc*Rc* (dot4_22(Ndir, Nc_hat)+ Ndir33*Nc_hat33) ); // R 与 |Dp| 相关
+
+/* 当前 R 与 |Dp| 已有 */
+U_R = U_of_R(Rn, d1Re, d1URu, 1e-30, NAN);
+
+double term_b[2][2] = {
+    { (U_R/Rn) * M__[0][0], (U_R/Rn) * M__[0][1] },
+    { (U_R/Rn) * M__[1][0], (U_R/Rn) * M__[1][1] }
+};
+
+ double term_b33 = (U_R/Rn) * M__33;
+
+
+
+
+
+
+/* ---------------- (c) 随动硬化块 ---------------- */
+
+
+/* 附加项 */
+double Bk[2][2];
+/* Bk = N + η^p (M N − N M) − (1/bk)( Mk + η_k^p (M Mk − Mk M) ) */
+mat_submul(Ndir, M, Ndir, d1nn, Bk); // 先 Bk = N + η^p(MN − NM)
+
+double tmpMk[2][2];
+mat_submul(Mk, M, Mk, d1n2, tmpMk); // tmpMk = Mk + η_k^p(MMk − MkM)
+Bk[0][0] -= (1.0/d1bk)*tmpMk[0][0];
+Bk[0][1] -= (1.0/d1bk)*tmpMk[0][1];
+Bk[1][0] -= (1.0/d1bk)*tmpMk[1][0];
+Bk[1][1] -= (1.0/d1bk)*tmpMk[1][1];
+/* extra_k = 2 sym( Bk * Mk ) */
+double prodBkMk[2][2];
+YMATMUL2(Bk, Mk, prodBkMk);
+double extra_k[2][2];
+YSYMMAT2(prodBkMk, extra_k);
+extra_k[0][0] *= 2.0; extra_k[0][1] *= 2.0;
+extra_k[1][0] *= 2.0; extra_k[1][1] *= 2.0;
+double extra_k33 = 2.0*(Ndir33 - (1.0/d1bk)*MK33)*MK33; // 平面应变假设
+
+
+
+/* term_c = R * (Yk + extra_k) */
+double term_c[2][2] = {
+    { Rn*(Yk[0][0] + extra_k[0][0]), Rn*(Yk[0][1] + extra_k[0][1]) },
+    { Rn*(Yk[1][0] + extra_k[1][0]), Rn*(Yk[1][1] + extra_k[1][1]) }
+};
+double term_c33 = Rn*(YK_33 + extra_k33);
+
+/* ---------------- (d) 弹性核块 ---------------- */
+
+
+/* 附加项 */
+double Bc[2][2];
+/* Bc = N + η^p (M N − N M) − (Rc/χ)( N̂_c + η_c^p (M N̂_c − N̂_c M) ) */
+mat_submul(Ndir, M, Ndir, d1nn, Bc); // Bc = N + η^p(MN − NM)
+double tmpNc[2][2];
+mat_submul(Nc_hat, M, Nc_hat, d1n2, tmpNc); // tmpNc = N̂_c + η_c^p(MN̂_c − N̂_cM)
+Bc[0][0] -= (Rc/d1Chi)*tmpNc[0][0];
+Bc[0][1] -= (Rc/d1Chi)*tmpNc[0][1];
+Bc[1][0] -= (Rc/d1Chi)*tmpNc[1][0];
+Bc[1][1] -= (Rc/d1Chi)*tmpNc[1][1];
+/* extra_c = 2 sym( Bc * Mc ) */
+double prodBcMc[2][2];
+YMATMUL2(Bc, Mc, prodBcMc);
+double extra_c[2][2];
+YSYMMAT2(prodBcMc, extra_c);
+extra_c[0][0] *= 2.0; extra_c[0][1] *= 2.0;
+extra_c[1][0] *= 2.0; extra_c[1][1] *= 2.0;
+double extra_c33 = 2.0*(Ndir33 - (Rc/d1Chi)*Nc_hat33)*MC33; // 平面应变假设
+/* term_d = (1-R) * (Yc + extra_c) */
+double term_d[2][2] = {
+    { (1.0-Rn)*(Yc[0][0] + extra_c[0][0]), (1.0-Rn)*(Yc[0][1] + extra_c[0][1]) },
+    { (1.0-Rn)*(Yc[1][0] + extra_c[1][0]), (1.0-Rn)*(Yc[1][1] + extra_c[1][1]) }};
+
+    double term_d33 =(1.0-Rn)*(YC_33 + extra_c33);
+
+
+
+
+double Mp_total[2][2] = {{0,0},{0,0}};
+
+/* 累加四块 */
+for (int i=0;i<2;++i){
+    for (int j=0;j<2;++j){
+        Mp_total[i][j] = term_a[i][j] + term_b[i][j] + term_c[i][j] + term_d[i][j];
+    }
+}
+double Mp_total33 = term_a33 + term_b33 + term_c33 + term_d33;
+
+/* 双点积 */
+double Mp_val = dot4_22(NG, Mp_total);
+Mp_val =Mp_val+ NG33* Mp_total33;
+
+/* === 3) 分母第二项 denom_extra = N : Le : sym(Ce * B) === */
+/* B = N + η^p (M N − N M) */
+double Bmat[2][2];
+mat_submul(Ndir, M, Ndir,  d1nn, Bmat); // out = N + η^p(MN − NM)
+
+/* CeB = Ce * Bmat */
+double CeB[2][2] = {
+    { Ce[0][0]*Bmat[0][0] + Ce[0][1]*Bmat[1][0],  Ce[0][0]*Bmat[0][1] + Ce[0][1]*Bmat[1][1] },
+    { Ce[1][0]*Bmat[0][0] + Ce[1][1]*Bmat[1][0],  Ce[1][0]*Bmat[0][1] + Ce[1][1]*Bmat[1][1] }
+};
+/* 对称化 */
+double Yb[2][2];
+YSYMMAT2(CeB, Yb);
+double Yb33 = CE33*Ndir33; // 平面应变假设 
+/* Le : Yb */
+double Wb[2][2];double Wb33;
+
+apply_Le_full_plane_strain(  Yb, Yb33, 
+                                              Wb, &Wb33  ,
+                                              Ce, CE33,
+                                              S, SS33, 
+                                              kappa, dpemu);
+/* denom_extra = N : Wb */
+double denom_extra = dot4_22(Ndir, Wb);
+denom_extra += Ndir33 * Wb33;
+/* === 4) 塑性乘子 Δλ̇ === */
+double denom = Mp_val +( 2*denom_extra);
+
+if (fabs(denom) > 1e-16) {
+    dlambda_dot = ( 2*num) / denom;
+    //dlambda_dot = 0.0;
+   // R[0][ielem] = (q + alpha_y * p )/( k_y);
+} else {
+    dlambda_dot = 0.0; // 或者做数值保护
+}
+
+              
+ R[0][ielem] = R[0][ielem] + U_R *  dlambda_dot*dcstec;
+ H[0][ielem] = H[0][ielem] + fHn *  dlambda_dot*dcstec;
+
+
+
+}
+}
+
+
+
+
+//dlambda_dot = 0.0;
+
+
+
+   /* 8) 速度梯度的塑性部分（式(114)） */
+ /* Lp = dlambda_dot * [ N + eta_p (M N − N M) ] */
+double Lp[2][2];
+mat_submul(Ndir, M, Ndir, d1nn, Lp);
+
+for(int i=0;i<2;++i)
+  for(int j=0;j<2;++j)
+    Lp[i][j] *= dlambda_dot;
+double Lp33 =dlambda_dot *( Ndir33 + d1nn * (M33*Ndir33 - Ndir33*M33)); // 平面应变假设
+
+/* 1)  Le : sym(Ce Le) */
+//double CeLe[2][2] = {
+//    { Ce[0][0]*(Lmid[0][0]-Lp[0][0]) + Ce[0][1]*(Lmid[1][0]-Lp[1][0]),  Ce[0][0]*(Lmid[0][1]-Lp[0][1]) + Ce[0][1]*(Lmid[1][1]-Lp[1][1]) },
+//    { Ce[1][0]*(Lmid[0][0]-Lp[0][0]) + Ce[1][1]*(Lmid[1][0]-Lp[1][0]),  Ce[1][0]*(Lmid[0][1]-Lp[0][1]) + Ce[1][1]*(Lmid[1][1]-Lp[1][1]) }
+//};
+//double Ynew[2][2];  // Y = sym(CeLe)
+//YSYMMAT2(CeLe, Ynew);
+//double Mdot[2][2];  // W = Le : Y
+//apply_Le_iso(Ynew, Mdot, kappa, dpemu);
+
+//double dM00 = Mdot[0][0] * dcstec, dM01 = Mdot[0][1] * dcstec;
+//double dM10 = Mdot[1][0] * dcstec, dM11 = Mdot[1][1] * dcstec;
+
+// 2) ΔS ≈ Ce_inv · ΔM（冻结 Ce 的小步近似）
+//double dS11 = Ce_inv[0][0]*dM00 + Ce_inv[0][1]*dM10;
+//double dS12 = Ce_inv[0][0]*dM01 + Ce_inv[0][1]*dM11;
+//double dS21 = Ce_inv[1][0]*dM00 + Ce_inv[1][1]*dM10;
+//double dS22 = Ce_inv[1][0]*dM01 + Ce_inv[1][1]*dM11;
+
+// 3) 平面应变约束更新 S33
+//double dS33 = dpenu * (dS11 + dS22) - dpeem *  dlambda_dot* dcstec * Ndir33; // E=dpeem, ν=dpenu
+//S33[0][ielem] += dS33;
+
+
+
+
+
+/* Lp_kd = (1/bk) * dlambda_dot * [ Mk + eta_k_p (M Mk − Mk M) ] */
+double Lp_kd[2][2];
+mat_submul(Mk, M, Mk, d1nP, Lp_kd);
+for(int i=0;i<2;++i)
+  for(int j=0;j<2;++j)
+    Lp_kd[i][j] *= (dlambda_dot / d1bk);
+double Lp_kd33 =(dlambda_dot / d1bk) *( MK33 + d1nP * (M33*MK33 - MK33*M33)); // 平面应变假设
+/* Lp_cd = (Rc/chi) * dlambda_dot * [ Nc_hat + eta_c_p (M Nc_hat − Nc_hat M) ] */
+double Lp_cd[2][2];
+mat_submul(Nc_hat, M, Nc_hat, d1n2, Lp_cd);
+for(int i=0;i<2;++i)
+  for(int j=0;j<2;++j)
+    Lp_cd[i][j] *= (dlambda_dot * Rc / d1Chi);
+double Lp_cd33 =(dlambda_dot * Rc / d1Chi) *( Nc_hat33 + d1n2 * (M33*Nc_hat33 - Nc_hat33*M33)); // 平面应变假设
+
+/* === (8) 等效塑性应变率与等效塑性应变更新 === */
+double Dp[2][2];  // 塑性应变率张量
+double eqp_dot = 0.0;  // 等效塑性应变率
+
+// 构造 Dp = 0.5 * (Lp + Lp^T)
+for (int i = 0; i < 2; i++) {
+  for (int j = 0; j < 2; j++) {
+    Dp[i][j] = 0.5 * (Lp[i][j] + Lp[j][i]);
+  }
+}
+double DP33 =Lp33; 
+// 计算 Dp : Dp
+double Dp_contract = 0.0;
+for (int i = 0; i < 2; i++) {
+  for (int j = 0; j < 2; j++) {
+    Dp_contract += Dp[i][j] * Dp[i][j];
+  }
+}
+Dp_contract += DP33 * DP33;
+// 计算等效塑性应变率
+eqp_dot = sqrt(2.0 / 3.0 * Dp_contract);
+
+if((ncstep%1000==0)&&(ielem==0)) { // 仅输出第一个单元第一个增量的信息
+  printf("dlambda_dot = %.6e\n", dlambda_dot);
+//printf("等效塑性应变率 = %.6e\n", eqp_dot);
+//printf("塑性应变增量 = %.6e\n", eqp_dot * dcstec);
+
+};
+
+
+
+// 更新等效塑性应变
+EPS[0][ielem] += eqp_dot * dcstec;
+
+/*
+ if(ielem==0)    
+ { 
+  
+      EPS[0][0] += Dp[1][1] * dcstec;
+    
+     
+        }
+*/
+
+
+/* === (9) 指数映射推进 === */
+DBL Fe_new[2][2],Fpks_new[2][2], Fpcs_new[2][2];
+DBL Feinv_new[2][2],Fpksinv_new[2][2], Fpcsinv_new[2][2];
+DBL Fp_new[2][2], Fpkd_new[2][2], Fpcd_new[2][2];
+DBL Fpinv_new[2][2], Fpkdinv_new[2][2], Fpcdinv_new[2][2];
+
+/* 1) 总塑性梯度 */
+push_Fp_expmap(Lp, Fp, dcstec, Fp_new);
+DBL Fp_new33=exp(dcstec * Lp33) * FP33;
+/* 2) 随动硬化耗散部分 */
+double tmp1[2][2], L_eff[2][2];
+double detLoc;
+
+/* L_eff_kd = Fpks^{-1} * Lp_kd * Fpks */
+YMATINV2(Fpks, tmp1, detLoc);                 // tmp1 = Fpks^{-1}
+if (fabs(detLoc) < EPSILON) continue;         // 奇异保护
+YMATMUL2(tmp1, Lp_kd, L_eff);
+YMATMUL2(L_eff, Fpks, L_eff);
+push_Fp_expmap(L_eff, Fpkd, dcstec, Fpkd_new);
+DBL Fpkd_new33=exp(dcstec * Lp_kd33) * FPKD33;//在面内做了矩阵变换,对于 33 分量，这个变换退化为标量乘法，结果就是原始
+/* 3) 弹性核耗散部分 */
+YMATINV2(Fpcs, tmp1, detLoc);                 // tmp1 = Fpks^{-1}
+if (fabs(detLoc) < EPSILON) continue;
+YMATMUL2(tmp1, Lp_cd, L_eff);
+YMATMUL2(L_eff, Fpcs, L_eff);
+push_Fp_expmap(L_eff, Fpcd, dcstec, Fpcd_new);
+DBL Fpcd_new33=exp(dcstec * Lp_cd33) * FPCD33;//在面内做了矩阵变换,对于 33 分量，这个变换退化为标量乘法，结果就是原始
+
+/* === (14) 历史变量写回（NINT=1）=== */
+
+/* 1) 塑性梯度 Fp_new → 历史 */
+Fp00[0][ielem] = Fp_new[0][0];
+Fp01[0][ielem] = Fp_new[0][1];
+Fp10[0][ielem] = Fp_new[1][0];
+Fp11[0][ielem] = Fp_new[1][1];
+Fp33[0][ielem] = Fp_new33;
+/* 2) 随动硬化耗散部分 Fpkd_new */
+Fpkd00[0][ielem] = Fpkd_new[0][0];
+Fpkd01[0][ielem] = Fpkd_new[0][1];
+Fpkd10[0][ielem] = Fpkd_new[1][0];
+Fpkd11[0][ielem] = Fpkd_new[1][1];
+Fpkd33[0][ielem] = Fpkd_new33;
+/* 3) 弹性核耗散部分 Fpcd_new */
+Fpcd00[0][ielem] = Fpcd_new[0][0];
+Fpcd01[0][ielem] = Fpcd_new[0][1];
+Fpcd10[0][ielem] = Fpcd_new[1][0];
+Fpcd11[0][ielem] = Fpcd_new[1][1];
+Fpcd33[0][ielem] = Fpcd_new33;
+
+
+//assert(R[0][ielem]<=1.0);
+
+
+
+
+YMATINV2(Fp_new, Fpinv_new, detFpLoc);
+assert(fabs(detFpLoc)>EPSILON);
+assert(fabs(detFpLoc)>1e-3);
+YMATMUL2(F, Fpinv_new, Fe_new);
+DBL FE33_new = F33/Fp_new33;
+
+
+Fe00[0][ielem] = Fe_new[0][0];
+Fe01[0][ielem] = Fe_new[0][1];
+Fe10[0][ielem] = Fe_new[1][0];
+Fe11[0][ielem] = Fe_new[1][1];
+Fe33[0][ielem] = FE33_new;
+
+
+
+
+
+YMATINV2(Fpkd_new, Fpkdinv_new, detFpkdLoc);
+assert(fabs(detFpkdLoc) > EPSILON);
+YMATMUL2(Fp_new, Fpkdinv_new, Fpks_new);
+DBL FPKS33_new = Fp_new33/Fpkd_new33;
+
+
+YMATINV2(Fpcd_new, Fpcdinv_new, detFpcdLoc);
+assert(fabs(detFpcdLoc) > EPSILON);
+YMATMUL2(Fp_new, Fpcdinv_new, Fpcs_new);
+DBL FPCS33_new = Fp_new33/Fpcd_new33;
+    /* === (4) pull‑back 到中间构型（式(10)）分解 Lmid = D + W（式(13)） ===
+       L = Fe^{-1} * l * Fe */
+      
+    YMATINV2(Fe_new, Feinv_new, detFeLoc);
+    for (i = 0; i < 2; ++i) {
+        for (j = 0; j < 2; ++j) {
+            Lmid[i][j] = 0.0;
+            for (k = 0; k < 2; ++k) {
+                for (int r = 0; r < 2; ++r) {
+                    Lmid[i][j] += Feinv_new[i][k] * Lglob[k][r] * Fe_new[r][j];
+                }
+            }
+        }
+    }
+
+
+    //Dm[0][0] = Lmid[0][0];
+    //Dm[1][1] = Lmid[1][1];
+    //Dm[0][1] = 0.5 * (Lmid[0][1] + Lmid[1][0]);
+    //Dm[1][0] = Dm[0][1];
+    //Wm[0][0] = 0.0;
+   // Wm[1][1] = 0.0;
+   // Wm[0][1] = 0.5 * (Lmid[0][1] - Lmid[1][0]);
+    //Wm[1][0] = -Wm[0][1];
+
+       /* === (5) 弹性应力（Ce, S, M） === */
+        for(i=0;i<2;i++){
+           for(j=0;j<2;j++){ 
+            Ce[i][j]=0.0; 
+            Cks[i][j] = 0.0;
+            Ccs[i][j] = 0.0;
+            for(k=0;k<2;k++) {
+            Ce[i][j]+=Fe_new[k][i]*Fe_new[k][j];
+            Cks[i][j] += Fpks_new[k][i]*Fpks_new[k][j];
+            Ccs[i][j] += Fpcs_new[k][i]*Fpcs_new[k][j];
+          }}
+        }
+
+
+
+  /* 2) Ce^{-1} */
+   // double Ce_inv[2][2], detCeinv;
+    YMATINV2(Ce, Ce_inv, detCeinv);
+    assert(fabs(Fp_new33)  > EPSILON);
+     CE33 = 1.0 /(Fp_new33*Fp_new33);
+     Ce_inv33 = Fp_new33*Fp_new33;
+
+   //double Cks_inv[2][2], detCksinv;
+    YMATINV2(Cks, Cks_inv, detCksinv);
+     CKS33 = FPKS33_new*FPKS33_new;
+    assert(fabs(Fpkd_new33)  > EPSILON);
+    assert(fabs(CKS33)  > EPSILON);
+     Cks_inv33 = 1.0 /(CKS33);
+
+
+    //double Ccs_inv[2][2], detCcsinv;
+    YMATINV2(Ccs, Ccs_inv, detCcsinv);
+     CCS33 = FPCS33_new*FPCS33_new;
+    assert(fabs(Fpcd_new33)  > EPSILON);
+    assert(fabs(CCS33)  > EPSILON);
+     Ccs_inv33 = 1.0 /(CCS33);
+
+
+/* 1) detCe, Je */
+ detCe = (Ce[0][0]*Ce[1][1] - Ce[0][1]*Ce[1][0]) * CE33;
+ Je = sqrt(detCe);
+assert(fabs(Je)  > EPSILON);
+assert(detCe > EPSILON);
+   lnJe = log(Je);
+
+  
+    /* 3) I1, J^{-2/3}, tr(C̄e) */
+     I1 = Ce[0][0] + Ce[1][1] + CE33;
+     Jm23 = pow(Je, -2.0/3.0);
+  trCbar = Jm23 * I1;
+
+
+   // double E[2][2];
+//double B[2][2];
+      for(i=0;i<2;i++)
+      { for(j=0;j<2;j++)
+        { B[i][j]=R0;
+          for(k=0;k<2;k++)
+          { B[i][j]=B[i][j]+Fe[i][k]*Fe[j][k]; /* left Cauchy-Green strain */
+          }
+
+          E[i][j]=RP5*B[i][j];               /* small strain             */
+          if(i==j)E[i][j]=E[i][j]-RP5;
+      } }
+
+
+ // E33 = 0.0;
+
+
+
+
+
+    // 2. 定义Z[2x2]（对应小应变E）和Z33（平面应变约束推导）
+    double Z[2][2];
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < 2; ++j) {
+            Z[i][j] = E[i][j]; // Z对应原有小应变张量E
+        }
+    }
+    double trE = E[0][0] + E[1][1]; // 面内应变张量迹
+    //double Z33 = - (nu / (1.0 - nu)) * trE; // 平面应变下的33方向应变
+double Z33 =0.0; 
+    // 3. 定义输出变量W[2x2]（弹性应力）和W33（面外应力，可按需存储）
+   // double W[2][2];
+   // double W33;
+
+    // 4. 调用apply_Le_iso1计算弹性本构应力
+    apply_Le_iso1(Z, Z33, W, &W33, Ktan, Gtan);
+
+    // 5. 叠加率相关项（dpeks*D），得到最终应力T（与原有逻辑一致）
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < 2; ++j) {
+            S[i][j] = W[i][j] ;
+        }
+    }
+ double SS33 = W33;
+
+
+    YMATMUL2(Ce, S, M);
+    double M33 = CE33 * SS33;
+ //   */
+
+
+
+
+
+
+
+
+    /* 12) Sk = Ck (I − Cks^{-1})，Sc 类似 */
+    for (int a=0; a<2; ++a){
+        for (int b=0; b<2; ++b){
+            Sk[a][b] = d1Ck  * (Iden[a][b] - Cks_inv[a][b]);
+            Sc[a][b] = d1Cc  * (Iden[a][b] - Ccs_inv[a][b]);
+        }
+    }
+
+    /* 13) Mk = Ck (Cks − I)，Mc 类似 */
+    for (int a=0; a<2; ++a){
+        for (int b=0; b<2; ++b){
+            Mk[a][b]  = d1Ck * (Cks[a][b] - Iden[a][b]);
+            Mc[a][b] = d1Cc * (Ccs[a][b] - Iden[a][b]);
+        }
+    }
+SK33 = d1Ck * (1.0 -  (Cks_inv33));
+ SC33 = d1Cc * (1.0 -  (Ccs_inv33));
+
+MK33 = d1Ck * (CKS33 - 1.0);
+MC33  = d1Cc * (CCS33 - 1.0);
+//double MK33 = 0.0, MC33 = 0.0; /* 若有核的33分量，填充它；否则留0 */
+
+
+
+
+
+
+
+/* === (6) DP with extended subloading (Section 8, Hashiguchi) === */
+
+/* 输入/历史：
+   - Mk00/Mk01/Mk11, Mc00/Mc01/Mc11 : (可选) 运动硬化/弹性核张量的分量（中间构型）
+   - R[0][ielem] : 当前次载面比 (0<=R<=1)，初始化可取 ~Re 或 0
+   - i1use_kinhard[ielem], i1use_ext_subloading[ielem] : 两个开关
+*/
+
+/* 6.0 构造有效 Mandel 应力 M_eff = M − R Mk − (1−R) Mc    或M_eff = M −  Mk  */
+double Meff_new[2][2] = { { M[0][0], M[0][1] }, { M[1][0], M[1][1] } };
+double M33_eff_new = M33;
+double Rn_new = R[0][ielem];                   /* 次载面比 */
+//Rn = fmin(1.0, fmax(0.0, Rn));             /* 夹紧到 [0,1] */
+/* 6.1  退化第7节M_eff = M −  Mk  */
+if (i1use_ext_subloading == 1 && i1use_kinhard == 0) {
+    Meff_new[0][0] -=  Mk[0][0];
+    Meff_new[0][1] -=  Mk[0][1];
+    Meff_new[1][0] -=  Mk[1][0];
+    Meff_new[1][1] -=  Mk[1][1];
+    M33_eff_new   -=  MK33;
+}
+
+/* 6.2 完整第8节M_eff = M − R Mk − (1−R) Mc */
+if (i1use_ext_subloading == 1 && i1use_kinhard == 1) {
+
+    Meff_new[0][0] = Meff_new[0][0]-Rn_new *Mk[0][0]-(1-Rn_new) * Mc[0][0];
+    Meff_new[0][1] = Meff_new[0][1]-Rn_new *Mk[0][1]-(1-Rn_new) * Mc[0][1];
+    Meff_new[1][0] = Meff_new[1][0]-Rn_new *Mk[1][0]-(1-Rn_new) * Mc[1][0];
+    Meff_new[1][1] = Meff_new[1][1]-Rn_new *Mk[1][1]-(1-Rn_new) * Mc[1][1];
+    M33_eff_new   = M33_eff_new  -Rn_new *MK33   -(1-Rn_new) * MC33;
+}
+
+/* 6.1 对称化 Meff           考虑各项异性的化就不应该对称  但是也不能用DP准则*/
+double Msym_new[2][2];double Msym33_new;
+Msym_new[0][0] = Meff_new[0][0];
+Msym_new[0][1] = 0.5*(Meff_new[0][1] + Meff_new[1][0]);
+Msym_new[1][0] = Msym_new[0][1];
+Msym_new[1][1] = Meff_new[1][1];
+Msym33_new = M33_eff_new;
+/* 6.2 p,q, dev(Msym) 基于 Meff 计算 */
+double trMsym_new = Msym_new[0][0] + Msym_new[1][1]+ Msym33_new;
+double p_new   = -(1.0/3.0)*trMsym_new;
+
+
+double devMsym_new[2][2];
+double one_third_tr_new = trMsym_new/3.0;
+devMsym_new[0][0] = Msym_new[0][0] - one_third_tr_new;
+devMsym_new[0][1] = Msym_new[0][1];
+devMsym_new[1][0] = Msym_new[1][0];
+devMsym_new[1][1] = Msym_new[1][1] - one_third_tr_new;
+double dev33_new  = Msym33_new     - one_third_tr_new;
+double dev3_new = devMsym_new[0][0]*devMsym_new[0][0]
+            + devMsym_new[0][1]*devMsym_new[0][1]
+            + devMsym_new[1][0]*devMsym_new[1][0]
+            + devMsym_new[1][1]*devMsym_new[1][1]
+            + dev33_new*dev33_new;
+
+double norm_devMsym_new = sqrt(dev3_new);
+double q_new = sqrt(1.5) * norm_devMsym_new;
+double dq_dM33_new = (q_new > 1e-14) ? (3.0/(2.0*q_new)) * dev33_new : 0.0;
+/* 6.3 DP 参数：alpha(φ) 与 k(c,H) */
+double phi_rad_new = d1phi * (MYPI/180.0); /* φ: 度 */
+double sinf_new = sin(phi_rad_new), cosf_new = cos(phi_rad_new);
+
+
+double Fhard_new = d1F0 + d1h1 * (1.0 - exp(-d1h2 * H[0][ielem])) + d1Hc * H[0][ielem];
+double c_eff_new = d1DPc + Fhard_new;
+
+
+double denom_new = sqrt(1.0 + (1.0/3.0)*sinf*sinf);
+double alpha_y_new = (sqrt(3.0)*sinf) / denom;
+double k_y_new     = (sqrt(3.0)*cosf*c_eff) / denom;
+
+//double denom_new = sqrt(1.0 + (1.0/3.0)*sinf_new*sinf_new);
+//double alpha_y_new = (sqrt(3.0)*sinf_new) / denom_new;
+//double k_y_new     = 3.0 * c_eff_new * (cosf_new / denom_new);
+//double alpha_y_new = (2.0*sinf_new) / (3.0 - sinf_new);
+//double k_y_new = (6.0 * c_eff_new * cosf_new) / (3.0 - sinf_new);
+
+/* 6.4 次载面缩放：f = q + α p − R·k */
+//double f_val_new = q_new + alpha_y_new * p_new - (Rn * k_y_new);
+double f_val_new = q_new + alpha_y_new * p_new - (R[0][ielem] * k_y_new);
+  if((ncstep%1==0)&& (ielem==0))
+      { //printf("p_new:%.10f,", p_new );
+
+        printf("f_val_1:%.10f,%1d\n", f_val_1, ncstep);
+        printf("f_val_new:%.10f,%1d\n", f_val_new, ncstep);
+        printf("R:%.10f\n,", R[0][ielem] );
+        if((f_val_new /f_val_1>0.0001)&& (ielem==0)){
+          printf("p_new:%.10f,", p_new );
+        }//printf("q_new:%.10f,", q_new );
+  }
+
+
+
+Fe[0][0] = Fe_new[0][0]; Fe[0][1] = Fe_new[0][1];
+Fe[1][0] = Fe_new[1][0]; Fe[1][1] = Fe_new[1][1];
+FE33 = FE33_new;
+
+
+
+
+
+  }
+/* === (11) 推送应力到当前构型（装配用 σ） === */
+
+
+
+
+/* 11.8 Kirchhoff 应力 tK = Fe * S * Fe^T */
+double tmp[2][2], tK[2][2];
+YMATMUL2(Fe,S,tmp);
+double Fe_T[2][2] = {{Fe[0][0], Fe[1][0]},
+                     {Fe[0][1], Fe[1][1]}};
+YMATMUL2(tmp, Fe_T,tK);
+
+/* 11.9 Cauchy 应力 σ = tK / J */
+double sig[2][2];
+for (int a=0; a<2; ++a){
+    for (int b=0; b<2; ++b){
+        sig[a][b] = tK[a][b] / Je+ dpeks * D[a][b];
+        //sig[a][b] = tK[a][b] / Je;
+    }
+}
+
+  DBL sig33 =(FE33*SS33*FE33) / Je; // 平面应变假设
+  if((ncstep%37==0)&& (ielem==0))
+      { 
+
+      { printf("T:%.10f,%.10f,%.10f,%.10f,%.10f,%1d\n", sig[0][0], sig[0][1], sig[1][0], sig[1][1],sig33,  ncstep);
+  }
+  }
+
+
+
+
+
+
+
+
+
+
+
+
+sigma00[0][ielem] = sig[0][0];
+sigma10[0][ielem] = sig[0][1];
+sigma11[0][ielem] = sig[1][1];
+sigma33[0][ielem] = sig33;
+//assert(sig[0][1]==sig[1][0]);
+
+  if((ncstep%1000==0)&& (ielem==0))
+      { printf("sigmap:%.10f,", 1/3.0*(sig[0][0]+sig[1][1]+sig33) );
+        
+  }
+      /* output history states */
+      r0x = d1ncix[(i2elto[0][ielem])];
+      r0y = d1nciy[(i2elto[0][ielem])];
+      r1x = d1ncix[(i2elto[1][ielem])];
+      r1y = d1nciy[(i2elto[1][ielem])];
+      r2x = d1ncix[(i2elto[2][ielem])];
+      r2y = d1nciy[(i2elto[2][ielem])];
+      for(ihys=0; ihys<nohys; ihys++)
+      { 
+	if(i1ohyt[ihys]==(YFLEE)) /* Strain energy */
+	{
+	  d1ohyt[ihys] = dctime;    /* output history time  */
+  //线弹性
+	  //  d1ohys[ihys] += 0.5 * ((E[0][0] * (2.0*dpemu*E[0][0]*(voli/volc) + dpela*(volc/voli-voli/volc))) +      /* output history state */
+    //                              (E[0][1] * (2.0*dpemu*E[0][1]*(voli/volc))) +
+    //                              (E[1][0] * (2.0*dpemu*E[1][0]*(voli/volc))) +
+    //                              (E[1][1] * (2.0*dpemu*E[1][1]*(voli/volc) + dpela*(volc/voli-voli/volc)))) * (volc/2);    
+	  
+
+/* Neo-Hookean strain energy density */
+    double W = 0.5 *  dpemu * (Jm23 * I1 - 3.0)
+             + 0.5 * kappa * (Je - 1.0) * (Je - 1.0);
+
+    /* 累加到历史变量，乘当前体积 */
+    d1ohys[ihys] += W * volc;
+
+
+
+
+
+
+
+// 非线性弹性（TI-MNH）
+    // /* 计算等容张量 Cbar = J^{-2/3} C */
+    // double Cbar11 = Jm23 * Ce[0][0];
+    // double Cbar22 = Jm23 * Ce[1][1];
+    // double Cbar33 = Jm23 * CE33;
+    // double trCbar_inplane = Cbar11 + Cbar22;
+
+    // /* 弹性能量密度（TI-MNH）：ψ = ψ_vol + ψ_dev */
+    // double psi_vol = 0.5 * K * lnJe * lnJe;
+    // double psi_dev = 0.5 * Gpar * (trCbar_inplane - 2.0)
+    //                + 0.5 * Gper * (Cbar33 - 1.0);
+    // double psi = psi_vol + psi_dev;
+
+    // /* 累积到历史变量，乘当前体积 volc（若历史量要保存总能量而非密度） */
+    // d1ohys[ihys] += psi * volc;
+
+
+	}
+	rpx=d1ohyx[ihys];  /* x coordinate of point P */
+        rpy=d1ohyy[ihys];  /* y coordinate of point P */
+        V2DCro(v0,(r1x-r0x),(r1y-r0y),(rpx-r0x),(rpy-r0y));
+        V2DCro(v1,(r2x-r1x),(r2y-r1y),(rpx-r1x),(rpy-r1y));
+        V2DCro(v2,(r0x-r2x),(r0y-r2y),(rpx-r2x),(rpy-r2y));
+
+        if((v0>R0)&&(v1>R0)&&(v2>R0))    /* if point is inside the triangle */
+        { if(i1ohyt[ihys]==(YFLDSXX))
+          { stprev=MAXIM((EPSILON),(ABS(d1ohys[ihys])));
+            if((ABS(sig[0][0]-stprev))>=dohyp)
+            { d1ohyt[ihys] = dctime;    /* output history time  */
+              d1ohys[ihys] = sig[0][0];    /* output history state */
+          } }
+          else if(i1ohyt[ihys]==(YFLDSXY))
+          { stprev=MAXIM((EPSILON),(ABS(d1ohys[ihys])));
+            if((ABS(sig[0][1]-stprev))>=dohyp)  /* if((ABS(R1-T[0][1]/stprev))>dohyp) */
+            { d1ohyt[ihys] = dctime;
+              d1ohys[ihys] = sig[0][1];
+          } }
+          else if(i1ohyt[ihys]==(YFLDSYY))
+          { stprev=MAXIM((EPSILON),(ABS(d1ohys[ihys])));
+            if((ABS(sig[1][1]-stprev))>=dohyp)
+            { d1ohyt[ihys] = dctime;
+              d1ohys[ihys] = sig[1][1];
+          } }
+          else if(i1ohyt[ihys]==(YFLDSZZ))
+          { d1ohyt[ihys] = dctime;
+            d1ohys[ihys] = R0;
+          }
+          else if(i1ohyt[ihys]==(YFLDSZX))
+          { d1ohyt[ihys] = dctime;
+            d1ohys[ihys] = R0;
+          }
+          else if(i1ohyt[ihys]==(YFLDSZY))
+          { d1ohyt[ihys] = dctime;
+            d1ohys[ihys] = R0;
+          }
+          else if(i1ohyt[ihys]==(YFLDVEL))
+          { stprev=MAXIM((EPSILON),(ABS(d1ohys[ihys])));
+            for(i=0; i<3; i++)
+            { V[i] = SQRT((d1nvcx[(i2elto[i][ielem])]*d1nvcx[(i2elto[i][ielem])])
+                         +(d1nvcy[(i2elto[i][ielem])]*d1nvcy[(i2elto[i][ielem])]));
+            }
+            if((ABS(((V[0]+V[1]+V[2])/R3)-stprev))>=dohyp)
+            { d1ohyt[ihys] = dctime;
+              d1ohys[ihys] = (V[0]+V[1]+V[2])/R3;  /* average velocity of element */
+          } }
+          else if(i1ohyt[ihys]==(YFLDVEX))
+          { stprev=MAXIM((EPSILON),(ABS(d1ohys[ihys])));
+            for(i=0; i<3; i++)
+            { V[i] = d1nvcx[(i2elto[i][ielem])];
+            }
+            if((ABS(((V[0]+V[1]+V[2])/R3)-stprev))>=dohyp)
+            { d1ohyt[ihys] = dctime;
+              d1ohys[ihys] = (V[0]+V[1]+V[2])/R3;  /* average velocity x of element */
+          } }
+          else if(i1ohyt[ihys]==(YFLDVEY))
+          { stprev=MAXIM((EPSILON),(ABS(d1ohys[ihys])));
+            for(i=0; i<3; i++)
+            { V[i] = d1nvcy[(i2elto[i][ielem])];
+            }
+            if((ABS(((V[0]+V[1]+V[2])/R3)-stprev))>=dohyp)
+            { d1ohyt[ihys] = dctime;
+              d1ohys[ihys] = (V[0]+V[1]+V[2])/R3;  /* average velocity y of element */
+            } 
+          } 
+      } }
+       
+
+
+        /* 14) 结点力装配（当前构型，σ·n，保持旧逻辑） */
+        for(i=0;i<3;i++){
+            j=i+1; if(j>2) j=0; k=j+1; if(k>2) k=0;
+            in=i2elto[i][ielem]; jn=i2elto[j][ielem]; kn=i2elto[k][ielem];
+            nx=d1nccy[kn]-d1nccy[jn];
+            ny=d1nccx[jn]-d1nccx[kn];
+            d1nmct[in]+=dpero*voli/YR6;
+            d1nfcx[in]+=(sig[0][0]*nx + sig[0][1]*ny)/R2;
+            d1nfcy[in]+=(sig[1][0]*nx + sig[1][1]*ny)/R2;
+
+	if (iuseis==1) /* Apply element in-situ stress */
+        { Tinsitu[0][0]=-dcstxx-dcsyxx*((d1nciy[i2elto[0][ielem]]+d1nciy[i2elto[1][ielem]]+d1nciy[i2elto[2][ielem]])/3.0 - dcsrfy);
+          Tinsitu[0][1]=-dcstxy-dcsyxy*((d1nciy[i2elto[0][ielem]]+d1nciy[i2elto[1][ielem]]+d1nciy[i2elto[2][ielem]])/3.0 - dcsrfy);
+          Tinsitu[1][0]=-dcstxy-dcsyxy*((d1nciy[i2elto[0][ielem]]+d1nciy[i2elto[1][ielem]]+d1nciy[i2elto[2][ielem]])/3.0 - dcsrfy);
+          Tinsitu[1][1]=-dcstyy-dcsyyy*((d1nciy[i2elto[0][ielem]]+d1nciy[i2elto[1][ielem]]+d1nciy[i2elto[2][ielem]])/3.0 - dcsrfy);
+	  /* Nodal Forces due to in-situ stress */
+	  d1nfcx[in]=d1nfcx[in]+(Tinsitu[0][0]*nx+Tinsitu[0][1]*ny)/R2;
+	  d1nfcy[in]=d1nfcy[in]+(Tinsitu[1][0]*nx+Tinsitu[1][1]*ny)/R2;
+	}
+	
+       /* Nodal Forces due to edge force*/
+        jnopr=i1nopr[jn];
+        knopr=i1nopr[kn];
+        if( ((DABS(d1pnap[jnopr]))>EPSILON)&&
+            ((DABS(d1pnap[knopr]))>EPSILON) )
+        { d1nfcx[jn]=d1nfcx[jn]-
+          d1pnap[jnopr]*d1pnaf[jnopr]*nx/R3-
+          d1pnap[knopr]*d1pnaf[knopr]*nx/YR6;
+          d1nfcy[jn]=d1nfcy[jn]-
+          d1pnap[jnopr]*d1pnaf[jnopr]*ny/R3-
+          d1pnap[knopr]*d1pnaf[knopr]*ny/YR6;
+          d1nfcx[kn]=d1nfcx[kn]-
+          d1pnap[jnopr]*d1pnaf[jnopr]*nx/YR6-
+          d1pnap[knopr]*d1pnaf[knopr]*nx/R3;
+          d1nfcy[kn]=d1nfcy[kn]-
+          d1pnap[jnopr]*d1pnaf[jnopr]*ny/YR6-
+          d1pnap[knopr]*d1pnaf[knopr]*ny/R3;
+        }
+        if( ((DABS(d1pnat[jnopr]))>EPSILON)&&
+            ((DABS(d1pnat[knopr]))>EPSILON) )
+        { d1nfcx[jn]=d1nfcx[jn]-
+          d1pnat[jnopr]*d1pnaf[jnopr]*ny/R3-
+          d1pnat[knopr]*d1pnaf[knopr]*ny/YR6;
+          d1nfcy[jn]=d1nfcy[jn]+
+          d1pnat[jnopr]*d1pnaf[jnopr]*nx/R3+
+          d1pnat[knopr]*d1pnaf[knopr]*nx/YR6;
+          d1nfcx[kn]=d1nfcx[kn]-
+          d1pnat[jnopr]*d1pnaf[jnopr]*ny/YR6-
+          d1pnat[knopr]*d1pnaf[knopr]*ny/R3;
+          d1nfcy[kn]=d1nfcy[kn]+
+          d1pnat[jnopr]*d1pnaf[jnopr]*nx/YR6+
+          d1pnat[knopr]*d1pnaf[knopr]*nx/R3;
+        }
+        
+
+
+            
+        }
+
+        /* 15) 原有的 in-situ/边界/吸收/开挖处理 */
+       
+
+}
+
+  }
+}
+
+
+
+static void Yfd2TRIELS(  /* small strain elastic triangle  */
+            nelem,
+            iprop,
+            npnfact,mprop,nprop,
+            d3pnfac,
+            i1ptyp,
+            dpeks,dpela, dpemu, dpero ,
+            dpsem,
+            dpeem,dpenu,
+            d1nccx,d1nccy,d1ncix,d1nciy,d1nfcx,
+            d1nfcy,d1nmct,d1nvcx,d1nvcy,d1pnaf,
+            d1pnap,d1pnat,
+            i1elpr,i1nopr,i2elto,
+            nohys, dohyp, dctime,
+            d1ohys, d1ohyt, d1ohyx, d1ohyy,
+            i1ohyt, npnset, d1elfr,
+            i1usan, d1peex, d1peey, d1pemx, d1pemy, d1peg,
+            iuseis, dcstxx, dcstxy, dcstyy,
+            dcsyxx, dcsyxy, dcsyyy, dcsrfy,
+            i1pnfx, i1pnfy,
+            i1pexc, i1nowe, iusehf,
+            nsbar, d2elstr, ncstep,
+            sigma00, sigma10, sigma11, sigma33,d1area,dcstec,
+            Fe00, Fe01, Fe10, Fe11,Fe33
+            )
+  YINT    nelem;
+  YINT    iprop;
+  YINT   npnfact; YINT    mprop; YINT    nprop;
+  YINT npnset;
+  DBL ***d3pnfac;
+  YINT i1ptyp;
+  DBL    dpeks; DBL   dpela; DBL    dpemu; DBL   dpero;
+  DBL   dpsem; DBL   dpeem; DBL    dpenu;
+  DBL *d1nccx; DBL  *d1nccy; DBL *d1ncix; DBL  *d1nciy; DBL *d1nfcx;
+  DBL *d1nfcy; DBL  *d1nmct; DBL *d1nvcx; DBL  *d1nvcy; DBL *d1pnaf;
+  DBL *d1pnap; DBL  *d1pnat;
+  YINT *i1elpr; YINT  *i1nopr; YINT **i2elto;
+  YINT   nohys; DBL    dohyp; DBL   dctime;
+  DBL *d1ohys; DBL  *d1ohyt; DBL  *d1ohyx; DBL *d1ohyy;
+  YINT *i1ohyt;
+  DBL *d1elfr;
+
+  YINT i1usan;
+  DBL d1peex; DBL d1peey; DBL d1pemx; DBL d1pemy; DBL d1peg;
+  
+  YINT iuseis; DBL  dcstxx; DBL  dcstxy;  DBL  dcstyy;
+  DBL  dcsyxx; DBL  dcsyxy;  DBL  dcsyyy; DBL dcsrfy; 
+  YINT *i1pnfx; YINT *i1pnfy;
+  YINT *i1pexc; YINT *i1nowe; YINT iusehf;
+  YINT nsbar; DBL **d2elstr; YINT ncstep; 
+  DBL   **sigma00; DBL **sigma10; DBL **sigma11; DBL **sigma33; DBL *d1area;DBL dcstec;
+   DBL   **Fe00; DBL **Fe01; DBL **Fe10; DBL **Fe11;DBL **Fe33;
+{ DBL nx,ny,voli,volc;
+  DBL v0, v1, v2, rpx, rpy, r0x, r0y, r1x, r1y, r2x, r2y, stprev;
+  DBL  V[3];
+  DBL  B[2][2];     /* left Cauchy-Green strain tensor                        */
+  DBL  D[2][2];     /* rate of deformation (stretching) tensor                */
+  DBL  E[2][2];     /* strain tensor (small strains)                          */
+  //DBL  F[2][2];     /* deformation gradient in global base                    */
+  DBL F0[2][2];     /* initial local base                                     */
+  DBL FX[2][2];     /* current local base                                     */
+  DBL F0inv[2][2];  /* global base in initial local base                      */
+  DBL FXinv[2][2];  /* global base in current local base                      */
+  DBL  L[2][2];     /* velocity gradient in global base                       */
+  DBL LX[2][2];     /* vel. gradient in current local base = delta x/delta X  */
+  DBL  T[2][2];     /* Cauchy stress                                          */
+  YINT ielem;
+  YINT i,j,k,in,jn,kn,jnopr,knopr;
+  YINT ihys;
+  DBL **d2fact;
+  DBL **d2time;
+  
+  DBL Tinsitu[2][2]; /* element in-situ stress */
+  DBL cp; /* element p-wave velocity */
+  DBL cs; /* element s-wave velocity */
+  DBL mu;
+  DBL lambda;
+  
+  /* Elastic constants for plane strain transverse isotropy */
+  DBL d1peex_pstrain; 
+  DBL d1peey_pstrain;
+  DBL d1pemx_pstrain;
+  DBL d1pemy_pstrain;
+  
+  DBL Delta;
+  
+  if(d1pnaf == DBL1NULL)
+  { d1pnaf = TalDBL1(mprop);
+  }
+  for(i=0; i<nprop; i++)
+  { d1pnaf[i]=R1;
+  }
+
+  if(d3pnfac != DBL3NULL)
+  { if(d3pnfac[0][0][0] != -R1)
+    { d2time = d3pnfac[0];
+      d2fact = d3pnfac[1];
+      for(j=0; j<npnset; j++)
+      { for(i=1; i<npnfact; i++)
+        { if((dctime>=d2time[j][i-1])&&(dctime<=d2time[j][i]))
+          { d1pnaf[j]=d2fact[j][i-1]-((d2fact[j][i-1]-d2fact[j][i])*
+                      ((dctime-d2time[j][i-1])/(d2time[j][i]-d2time[j][i-1])));
+  } } } } }
+  
+  for(ielem=0;ielem<nelem;ielem++)
+  { if(i1elpr[ielem]==iprop)
+    { for(i=1;i<3;i++)
+      { F0[0][i-1]=d1ncix[(i2elto[i][ielem])]-d1ncix[(i2elto[0][ielem])];
+        F0[1][i-1]=d1nciy[(i2elto[i][ielem])]-d1nciy[(i2elto[0][ielem])];
+        FX[0][i-1]=d1nccx[(i2elto[i][ielem])]-d1nccx[(i2elto[0][ielem])];
+        FX[1][i-1]=d1nccy[(i2elto[i][ielem])]-d1nccy[(i2elto[0][ielem])];
+        LX[0][i-1]=d1nvcx[(i2elto[i][ielem])]-d1nvcx[(i2elto[0][ielem])];
+        LX[1][i-1]=d1nvcy[(i2elto[i][ielem])]-d1nvcy[(i2elto[0][ielem])];
+      }
+      YMATINV2(F0,F0inv,voli);
+      YMATINV2(FX,FXinv,volc);
+       d1area[ielem]=volc/2;
+
+double F_old[2][2], F_new[2][2];
+
+F_old[0][0] = Fe00[0][ielem]; F_old[0][1] = Fe01[0][ielem];
+F_old[1][0] = Fe10[0][ielem]; F_old[1][1] = Fe11[0][ielem];
+DBL F33_old = Fe33[0][ielem];
+
+
+
+
+      for(i=0;i<2;i++)
+      { for(j=0;j<2;j++)
+        { //F[i][j]=R0;
+          L[i][j]=R0;
+          for(k=0;k<2;k++)
+          { //F[i][j]=F[i][j]+FX[i][k]*F0inv[k][j];
+
+
+            L[i][j]=L[i][j]+LX[i][k]*FXinv[k][j];
+      } } }
+
+push_Fp_expmap(L, F_old, dcstec, F_new);
+
+Fe00[0][ielem] =F_new[0][0] ; Fe01[0][ielem] = F_new[0][1] ;
+Fe10[0][ielem] = F_new[1][0] ; Fe11[0][ielem] =F_new[1][1]  ;
+Fe33[0][ielem] = 1.0;
+
+
+      for(i=0;i<2;i++)
+      { for(j=0;j<2;j++)
+        { B[i][j]=R0;
+          for(k=0;k<2;k++)
+          { B[i][j]=B[i][j]+F_new[i][k]*F_new[j][k]; /* left Cauchy-Green strain */
+          }
+          D[i][j]=RP5*(L[i][j]+L[j][i]);     /* rate of deformation      */
+          E[i][j]=RP5*B[i][j];               /* small strain             */
+          if(i==j)E[i][j]=E[i][j]-RP5;
+      } }
+      if(i1usan==1) /* Apply transversely isotropic elastic constitutive law (plane stress)*/
+      { T[0][0] = (d1peex / (1 - d1pemx * d1pemy)) * (E[0][0] + d1pemy * E[1][1]) + dpeks * D[0][0];
+        T[1][1] = (d1peey / (1 - d1pemx * d1pemy)) * (E[1][1] + d1pemx * E[0][0]) + dpeks * D[1][1];
+        T[0][1] =  (2 * d1peg) * E[0][1] + dpeks * D[0][1];
+        T[1][0] =  (2 * d1peg) * E[1][0] + dpeks * D[1][0];
+      }
+      else if(i1usan==2) /* Apply transversely isotropic elastic constitutive law (plane strain)*/
+      { d1peex_pstrain = d1peex / (1 - d1pemx * d1pemy);
+        d1peey_pstrain = d1peey / (1 - d1pemy * d1pemx);
+	d1pemx_pstrain = (d1pemx + d1pemx * d1pemy) / (1 - d1pemx * d1pemy);
+	d1pemy_pstrain = (d1pemy + d1pemx * d1pemy) / (1 - d1pemx * d1pemy);
+	
+	T[0][0] = (d1peex_pstrain / (1 - d1pemx_pstrain * d1pemy_pstrain)) * (E[0][0] + d1pemy_pstrain * E[1][1]) + dpeks * D[0][0];
+        T[1][1] = (d1peey_pstrain / (1 - d1pemx_pstrain * d1pemy_pstrain)) * (E[1][1] + d1pemx_pstrain * E[0][0]) + dpeks * D[1][1];
+        T[0][1] =  (2 * d1peg) * E[0][1] + dpeks * D[0][1];
+        T[1][0] =  (2 * d1peg) * E[1][0] + dpeks * D[1][0];
+      }
+      else
+      { if (i1ptyp == YTE2TRIELS)
+        {
+          for(i=0;i<2;i++)    
+          {  
+              for(j=0;j<2;j++)
+              { T[i][j]=R2*dpemu*E[i][j]*(voli/volc)+dpeks*D[i][j];
+              }
+              T[i][i]=T[i][i]+dpela*(volc/voli-voli/volc);
+          }
+        }
+        /* Plane Stress formulation based on E,nu */
+        else if (i1ptyp == YTE2PLANESTRESS)
+        {        
+          T[0][0] = (dpeem / (1 - dpenu*dpenu)) * (E[0][0] + dpenu * E[1][1]) + dpeks * D[0][0];
+          T[1][1] = (dpeem / (1 - dpenu*dpenu)) * (E[1][1] + dpenu * E[0][0]) + dpeks * D[1][1];
+          T[0][1] = (dpeem / (1 + dpenu)) * E[0][1] + dpeks * D[0][1];
+          T[1][0] = (dpeem / (1 + dpenu)) * E[1][0] + dpeks * D[1][0];
+        }
+        /* Plane Strain formulation based on E,nu */
+        else if (i1ptyp == YTE2PLANESTRAIN)
+        {
+
+         //  T[0][0] = dpeem/((1+dpenu)*(1-2*dpenu)) * ( (1-dpenu)*E[0][0] +  dpenu*E[1][1]) + dpeks * D[0][0];
+          // T[1][1] = dpeem/((1+dpenu)*(1-2*dpenu)) * ( (1-dpenu)*E[1][1] +  dpenu*E[0][0]) + dpeks * D[1][1];
+           //T[0][1] = (dpeem / (1+dpenu)) * E[0][1] + dpeks * D[0][1];
+          // T[1][0] = (dpeem / (1+dpenu)) * E[1][0] + dpeks * D[1][0];
+        
+           // 1. 定义临时变量存储弹性应力（新函数仅计算弹性项，率相关项后续叠加）
+    // double elastic_T[2][2];
+
+     // 2. 调用函数计算平面应变下的弹性应力
+     // 参数：输入应变E、输出弹性应力elastic_T、杨氏模量dpeem、泊松比dpenu
+    // apply_Le_iso_plane_strain(E, elastic_T, dpeem, dpenu);
+
+     // 3. 叠加率相关项（dpeks * D），得到最终应力T（与原有逻辑完全一致）
+    // for (int i = 0; i < 2; ++i) {
+    //     for (int j = 0; j < 2; ++j) {
+     //        T[i][j] = elastic_T[i][j] + dpeks * D[i][j];
+    //     }
+    // }
+        /* Plane Strain formulation based on E,nu （替换为apply_Le_iso1实现）*/
+      //  /*
+    // 1. 计算Gtan和Ktan（由E和nu转换）
+  
+    double nu = dpenu;
+    double Gtan = dpeem / (2.0 * (1.0 + nu));
+    double Ktan = dpeem / (3.0 * (1.0 - 2.0 * nu));
+
+    // 2. 定义Z[2x2]（对应小应变E）和Z33（平面应变约束推导）
+    double Z[2][2];
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < 2; ++j) {
+            Z[i][j] = E[i][j]; // Z对应原有小应变张量E
+        }
+    }
+    double trE = E[0][0] + E[1][1]; // 面内应变张量迹
+    //double Z33 = - (nu / (1.0 - nu)) * trE; // 平面应变下的33方向应变
+double Z33 =0.0; 
+    // 3. 定义输出变量W[2x2]（弹性应力）和W33（面外应力，可按需存储）
+    double W[2][2];
+    double W33;
+
+    // 4. 调用apply_Le_iso1计算弹性本构应力
+    apply_Le_iso1(Z, Z33, W, &W33, Ktan, Gtan);
+
+    // 5. 叠加率相关项（dpeks*D），得到最终应力T（与原有逻辑一致）
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < 2; ++j) {
+            T[i][j] = W[i][j] + dpeks * D[i][j];
+        }
+    }
+
+
+   //  */
+
+
+
+        }
+      }
+      if((ncstep%1==0)&& (ielem==0))
+      { 
+
+      { printf("T:%.10f,%.10f,%.10f,%.10f,%.10f,%1d\n", T[0][0], T[0][1], T[1][0], T[1][1],  ncstep);
+  } 
+  }
+      /* output history states */
+      r0x = d1ncix[(i2elto[0][ielem])];
+      r0y = d1nciy[(i2elto[0][ielem])];
+      r1x = d1ncix[(i2elto[1][ielem])];
+      r1y = d1nciy[(i2elto[1][ielem])];
+      r2x = d1ncix[(i2elto[2][ielem])];
+      r2y = d1nciy[(i2elto[2][ielem])];
+      for(ihys=0; ihys<nohys; ihys++)
+      { 
+	if(i1ohyt[ihys]==(YFLEE)) /* Strain energy */
+	{
+	  d1ohyt[ihys] = dctime;    /* output history time  */
+          if(i1usan==1) /* Transversely isotropic elasticity */
+	  { d1ohys[ihys] += 0.5 * ((E[0][0] * ((d1peex / (1 - d1pemx * d1pemy)) * (E[0][0] + d1pemy * E[1][1]))) +      /* output history state */
+                                   (E[0][1] * ((1 / (2 * d1peg)) * E[0][1])) +
+                                   (E[1][0] * ((1 / (2 * d1peg)) * E[0][1])) +
+                                   (E[1][1] * ((d1peey / (1 - d1pemx * d1pemy)) * (E[1][1] + d1pemx * E[0][0])))) * (volc/2);    
+	  }
+	  else if(i1usan==2) /* Transversely isotropic elasticity (plane strain) */
+	  { d1peex_pstrain = d1peex / (1 - d1pemx * d1pemy);
+            d1peey_pstrain = d1peey / (1 - d1pemy * d1pemx);
+	    d1pemx_pstrain = (d1pemx + d1pemx * d1pemy) / (1 - d1pemx * d1pemy);
+	    d1pemy_pstrain = (d1pemy + d1pemx * d1pemy) / (1 - d1pemx * d1pemy);
+	    d1ohys[ihys] += 0.5 * ((E[0][0] * ((d1peex_pstrain / (1 - d1pemx_pstrain * d1pemy_pstrain)) * (E[0][0] + d1pemy * E[1][1]))) +      /* output history state */
+                                   (E[0][1] * ((1 / (2 * d1peg)) * E[0][1])) +
+                                   (E[1][0] * ((1 / (2 * d1peg)) * E[0][1])) +
+                                   (E[1][1] * ((d1peey_pstrain / (1 - d1pemx_pstrain * d1pemy_pstrain)) * (E[1][1] + d1pemx_pstrain * E[0][0])))) * (volc/2);    
+	  }
+	  else /* Isotropic elasticity */
+	  { d1ohys[ihys] += 0.5 * ((E[0][0] * (2.0*dpemu*E[0][0]*(voli/volc) + dpela*(volc/voli-voli/volc))) +      /* output history state */
+                                 (E[0][1] * (2.0*dpemu*E[0][1]*(voli/volc))) +
+                                 (E[1][0] * (2.0*dpemu*E[1][0]*(voli/volc))) +
+                                 (E[1][1] * (2.0*dpemu*E[1][1]*(voli/volc) + dpela*(volc/voli-voli/volc)))) * (volc/2);    
+	  }
+	}
+	rpx=d1ohyx[ihys];  /* x coordinate of point P */
+        rpy=d1ohyy[ihys];  /* y coordinate of point P */
+        V2DCro(v0,(r1x-r0x),(r1y-r0y),(rpx-r0x),(rpy-r0y));
+        V2DCro(v1,(r2x-r1x),(r2y-r1y),(rpx-r1x),(rpy-r1y));
+        V2DCro(v2,(r0x-r2x),(r0y-r2y),(rpx-r2x),(rpy-r2y));
+
+        if((v0>R0)&&(v1>R0)&&(v2>R0))    /* if point is inside the triangle */
+        { if(i1ohyt[ihys]==(YFLDSXX))
+          { stprev=MAXIM((EPSILON),(ABS(d1ohys[ihys])));
+            if((ABS(T[0][0]-stprev))>=dohyp)
+            { d1ohyt[ihys] = dctime;    /* output history time  */
+              d1ohys[ihys] = T[0][0];    /* output history state */
+          } }
+          else if(i1ohyt[ihys]==(YFLDSXY))
+          { stprev=MAXIM((EPSILON),(ABS(d1ohys[ihys])));
+            if((ABS(T[0][1]-stprev))>=dohyp)  /* if((ABS(R1-T[0][1]/stprev))>dohyp) */
+            { d1ohyt[ihys] = dctime;
+              d1ohys[ihys] = T[0][1];
+          } }
+          else if(i1ohyt[ihys]==(YFLDSYY))
+          { stprev=MAXIM((EPSILON),(ABS(d1ohys[ihys])));
+            if((ABS(T[1][1]-stprev))>=dohyp)
+            { d1ohyt[ihys] = dctime;
+              d1ohys[ihys] = T[1][1];
+          } }
+          else if(i1ohyt[ihys]==(YFLDSZZ))
+          { d1ohyt[ihys] = dctime;
+            d1ohys[ihys] = R0;
+          }
+          else if(i1ohyt[ihys]==(YFLDSZX))
+          { d1ohyt[ihys] = dctime;
+            d1ohys[ihys] = R0;
+          }
+          else if(i1ohyt[ihys]==(YFLDSZY))
+          { d1ohyt[ihys] = dctime;
+            d1ohys[ihys] = R0;
+          }
+          else if(i1ohyt[ihys]==(YFLDVEL))
+          { stprev=MAXIM((EPSILON),(ABS(d1ohys[ihys])));
+            for(i=0; i<3; i++)
+            { V[i] = SQRT((d1nvcx[(i2elto[i][ielem])]*d1nvcx[(i2elto[i][ielem])])
+                         +(d1nvcy[(i2elto[i][ielem])]*d1nvcy[(i2elto[i][ielem])]));
+            }
+            if((ABS(((V[0]+V[1]+V[2])/R3)-stprev))>=dohyp)
+            { d1ohyt[ihys] = dctime;
+              d1ohys[ihys] = (V[0]+V[1]+V[2])/R3;  /* average velocity of element */
+          } }
+          else if(i1ohyt[ihys]==(YFLDVEX))
+          { stprev=MAXIM((EPSILON),(ABS(d1ohys[ihys])));
+            for(i=0; i<3; i++)
+            { V[i] = d1nvcx[(i2elto[i][ielem])];
+            }
+            if((ABS(((V[0]+V[1]+V[2])/R3)-stprev))>=dohyp)
+            { d1ohyt[ihys] = dctime;
+              d1ohys[ihys] = (V[0]+V[1]+V[2])/R3;  /* average velocity x of element */
+          } }
+          else if(i1ohyt[ihys]==(YFLDVEY))
+          { stprev=MAXIM((EPSILON),(ABS(d1ohys[ihys])));
+            for(i=0; i<3; i++)
+            { V[i] = d1nvcy[(i2elto[i][ielem])];
+            }
+            if((ABS(((V[0]+V[1]+V[2])/R3)-stprev))>=dohyp)
+            { d1ohyt[ihys] = dctime;
+              d1ohys[ihys] = (V[0]+V[1]+V[2])/R3;  /* average velocity y of element */
+            } 
+          } 
+      } }
+       
+      /* Store element stress tensor only if rebars are used */ 
+      if(nsbar>0)
+      { d2elstr[0][ielem]=T[0][0];
+        d2elstr[1][ielem]=T[0][1];
+        d2elstr[2][ielem]=T[1][0]; 
+        d2elstr[3][ielem]=T[1][1];
+      }
+
+      /* Nodal Forces */
+      for(i=0;i<3;i++)
+      { j=i+1; if(j>2)j=0;
+        k=j+1; if(k>2)k=0;
+        in=i2elto[i][ielem];
+        jn=i2elto[j][ielem];
+        kn=i2elto[k][ielem];
+
+        nx=d1nccy[kn]-d1nccy[jn];
+        ny=d1nccx[jn]-d1nccx[kn];
+        d1nmct[in]=d1nmct[in]+dpero*voli/YR6;
+        d1nfcx[in]=d1nfcx[in]+(T[0][0]*nx+T[0][1]*ny)/R2;
+        d1nfcy[in]=d1nfcy[in]+(T[1][0]*nx+T[1][1]*ny)/R2;
+	sigma00[0][ielem] = T[0][0];
+  sigma10[0][ielem] = T[0][1];
+  sigma11[0][ielem] = T[1][1];
+  sigma33[0][ielem] = 0.0;
+	if (iuseis==1) /* Apply element in-situ stress */
+        { Tinsitu[0][0]=-dcstxx-dcsyxx*((d1nciy[i2elto[0][ielem]]+d1nciy[i2elto[1][ielem]]+d1nciy[i2elto[2][ielem]])/3.0 - dcsrfy);
+          Tinsitu[0][1]=-dcstxy-dcsyxy*((d1nciy[i2elto[0][ielem]]+d1nciy[i2elto[1][ielem]]+d1nciy[i2elto[2][ielem]])/3.0 - dcsrfy);
+          Tinsitu[1][0]=-dcstxy-dcsyxy*((d1nciy[i2elto[0][ielem]]+d1nciy[i2elto[1][ielem]]+d1nciy[i2elto[2][ielem]])/3.0 - dcsrfy);
+          Tinsitu[1][1]=-dcstyy-dcsyyy*((d1nciy[i2elto[0][ielem]]+d1nciy[i2elto[1][ielem]]+d1nciy[i2elto[2][ielem]])/3.0 - dcsrfy);
+	  /* Nodal Forces due to in-situ stress */
+	  d1nfcx[in]=d1nfcx[in]+(Tinsitu[0][0]*nx+Tinsitu[0][1]*ny)/R2;
+	  d1nfcy[in]=d1nfcy[in]+(Tinsitu[1][0]*nx+Tinsitu[1][1]*ny)/R2;
+	}
+	
+       /* Nodal Forces due to edge force*/
+        jnopr=i1nopr[jn];
+        knopr=i1nopr[kn];
+        if( ((DABS(d1pnap[jnopr]))>EPSILON)&&
+            ((DABS(d1pnap[knopr]))>EPSILON) )
+        { d1nfcx[jn]=d1nfcx[jn]-
+          d1pnap[jnopr]*d1pnaf[jnopr]*nx/R3-
+          d1pnap[knopr]*d1pnaf[knopr]*nx/YR6;
+          d1nfcy[jn]=d1nfcy[jn]-
+          d1pnap[jnopr]*d1pnaf[jnopr]*ny/R3-
+          d1pnap[knopr]*d1pnaf[knopr]*ny/YR6;
+          d1nfcx[kn]=d1nfcx[kn]-
+          d1pnap[jnopr]*d1pnaf[jnopr]*nx/YR6-
+          d1pnap[knopr]*d1pnaf[knopr]*nx/R3;
+          d1nfcy[kn]=d1nfcy[kn]-
+          d1pnap[jnopr]*d1pnaf[jnopr]*ny/YR6-
+          d1pnap[knopr]*d1pnaf[knopr]*ny/R3;
+        }
+        if( ((DABS(d1pnat[jnopr]))>EPSILON)&&
+            ((DABS(d1pnat[knopr]))>EPSILON) )
+        { d1nfcx[jn]=d1nfcx[jn]-
+          d1pnat[jnopr]*d1pnaf[jnopr]*ny/R3-
+          d1pnat[knopr]*d1pnaf[knopr]*ny/YR6;
+          d1nfcy[jn]=d1nfcy[jn]+
+          d1pnat[jnopr]*d1pnaf[jnopr]*nx/R3+
+          d1pnat[knopr]*d1pnaf[knopr]*nx/YR6;
+          d1nfcx[kn]=d1nfcx[kn]-
+          d1pnat[jnopr]*d1pnaf[jnopr]*ny/YR6-
+          d1pnat[knopr]*d1pnaf[knopr]*ny/R3;
+          d1nfcy[kn]=d1nfcy[kn]+
+          d1pnat[jnopr]*d1pnaf[jnopr]*nx/YR6+
+          d1pnat[knopr]*d1pnaf[knopr]*nx/R3;
+        }
+        /* Nodal forces due to absorbing boundary condition */
+        if (i1ptyp == YTE2TRIELS)
+        { cp=SQRT((2*dpemu+dpela)/dpero);
+          cs=SQRT(dpemu/dpero);
+        }
+        else if (i1ptyp == YTE2PLANESTRESS)
+        { lambda=(dpeem*dpenu)/((1+dpenu)*(1-2*dpenu));
+          mu=(dpeem)/(2*(1+dpenu));
+          cp=SQRT((2*mu+lambda)/dpero);
+          cs=SQRT(mu/dpero);
+        }  
+        else if (i1ptyp == YTE2PLANESTRAIN)
+        { lambda=(dpeem*dpenu)/((1+dpenu)*(1-2*dpenu));
+          mu=(dpeem)/(2*(1+dpenu));
+          cp=SQRT((2*mu+lambda)/dpero);
+          cs=SQRT(mu/dpero);
+        }
+        if ((i1pnfx[jnopr]==4)&&(i1pnfx[knopr]==4))
+        { cp=SQRT((2*dpemu+dpela)/dpero);
+          cs=SQRT(dpemu/dpero);
+          d1nfcx[jn]=d1nfcx[jn]-dpero*cp*d1nvcx[jn]*ABS(nx)/R3-
+                     dpero*cp*d1nvcx[kn]*ABS(nx)/YR6-
+                     dpero*cs*d1nvcx[jn]*ABS(ny)/R3-
+                     dpero*cs*d1nvcx[kn]*ABS(ny)/YR6;
+          d1nfcx[kn]=d1nfcx[kn]-dpero*cp*d1nvcx[jn]*ABS(nx)/YR6-
+                     dpero*cp*d1nvcx[kn]*ABS(nx)/R3-
+                     dpero*cs*d1nvcx[jn]*ABS(ny)/YR6-
+                     dpero*cs*d1nvcx[kn]*ABS(ny)/R3;
+        }
+        if ((i1pnfy[jnopr]==4)&&(i1pnfy[knopr]==4))
+        { cp=SQRT((2*dpemu+dpela)/dpero);
+          cs=SQRT(dpemu/dpero);
+          d1nfcy[jn]=d1nfcy[jn]-dpero*cp*d1nvcy[jn]*ABS(ny)/R3-
+                     dpero*cp*d1nvcy[kn]*ABS(ny)/YR6-
+                     dpero*cs*d1nvcy[jn]*ABS(nx)/R3-
+                     dpero*cs*d1nvcy[kn]*ABS(nx)/YR6;
+          d1nfcy[kn]=d1nfcy[kn]-dpero*cp*d1nvcy[jn]*ABS(ny)/YR6-
+          dpero*cp*d1nvcy[kn]*ABS(ny)/R3-
+          dpero*cs*d1nvcy[jn]*ABS(nx)/YR6-
+          dpero*cs*d1nvcy[kn]*ABS(nx)/R3;
+        }
+      }
+      //! If element is "excavated" set nodal boundary condition to v_x = 0 and v_y = 0 (hardcoded bc ID)
+      //! and translate by a constant vector (hardcoded, 200)
+      if(i1pexc[i1elpr[ielem]]==1)
+      { i1nopr[i2elto[0][ielem]] = 1; /* 1 is a hard-coded value */
+        i1nopr[i2elto[1][ielem]] = 1; /* 1 is a hard-coded value */
+	i1nopr[i2elto[2][ielem]] = 1; /* 1 is a hard-coded value */
+	Delta = 200;
+	d1nccx[(i2elto[0][ielem])]=d1ncix[(i2elto[0][ielem])]+Delta;
+	d1nccx[(i2elto[1][ielem])]=d1ncix[(i2elto[1][ielem])]+Delta;
+	d1nccx[(i2elto[2][ielem])]=d1ncix[(i2elto[2][ielem])]+Delta;
+	d1nccy[(i2elto[0][ielem])]=d1nciy[(i2elto[0][ielem])]+Delta;
+	d1nccy[(i2elto[1][ielem])]=d1nciy[(i2elto[1][ielem])]+Delta;
+	d1nccy[(i2elto[2][ielem])]=d1nciy[(i2elto[2][ielem])]+Delta;
+	if(iusehf==1)
+	{ //! For hydrofrac: set nodes to be non-wettable
+	  i1nowe[i2elto[0][ielem]]=3;
+	  i1nowe[i2elto[1][ielem]]=3;
+	  i1nowe[i2elto[2][ielem]]=3;
+	}
+      }
+    }
+  }
+  FREE(d1pnaf);
+}
+
+static void Yfd2JOINTS(  /* joint element */
+            nelem, iprop,
+            dpeft, dpegf, dpegs,
+            dpeco, dpefr, dpepe,
+            d1nccx,d1nccy,d1nfcx,d1nfcy,d1nvcx,
+            d1nvcy,
+            i1elpr,i2elto,d1elfs,
+            dctime, dcstec, nebrk,netbrk,i1ebrk,d2ecbrk,d2ecbrk_NEW,
+            d1etbrk,d1elbrk,d1efe,
+            nesft,netsft,i1esft,d2ecsft,d1etsft,i1esftf,d1ebrkf,
+            d1eike,d1edke,d1nmct,d1etmke,
+            i2elnext,i2eledge,
+            i1pexc,
+            dusaf,dpealp,
+            dpecor,dpefrrd,dpeftr,dpegfr,dpegsr,
+            i1nowe,i2noid, 
+            iusefn,i1edfnf,ddfnft,ddfnco,ddfngf,ddfngs,iusehf,
+            i1edft,d1etike,iusesm,dctwle,
+            iusehy,d2eldmg,EPS,d2dmg,d2D
+            )
+  YINT   nelem; YINT   iprop;
+  DBL   dpeft; DBL   dpegf; DBL   dpegs;
+  DBL   dpeco; DBL   dpefr; DBL   dpepe;
+  DBL *d1nccx; DBL *d1nccy; DBL *d1nfcx; DBL *d1nfcy;
+  DBL *d1nvcx; DBL *d1nvcy;
+  YINT *i1elpr; YINT **i2elto; DBL *d1elfs;
+  DBL dctime; DBL dcstec;
+  YINT  *nebrk; YINT  *netbrk; YINT *i1ebrk;
+  DBL  **d2ecbrk; DBL  **d2ecbrk_NEW; DBL *d1etbrk; DBL *d1elbrk; DBL *d1efe;
+  YINT  *nesft; YINT  *netsft; YINT *i1esft;
+  DBL  **d2ecsft; DBL *d1etsft; YINT *i1esftf; DBL *d1ebrkf;
+  DBL *d1eike; DBL *d1edke; DBL *d1nmct; DBL *d1etmke;
+  YINT **i2elnext; YINT **i2eledge;
+  YINT *i1pexc;
+  DBL dusaf; DBL dpealp; DBL dpecor; DBL dpefrrd; DBL dpeftr; DBL dpegfr; DBL dpegsr;
+  YINT *i1nowe; YINT **i2noid; 
+  YINT iusefn; YINT *i1edfnf; DBL ddfnft; DBL ddfnco; DBL ddfngf; DBL ddfngs; YINT iusehf;
+  YINT *i1edft; DBL *d1etike; YINT iusesm; DBL dctwle;
+  YINT iusehy; DBL **d2eldmg; DBL **EPS; DBL **d2dmg; DBL **d2D;
+  
+{ DBL dpefa=0.63;
+  DBL dpefb=1.8;
+  DBL dpefc=6.0;
+  DBL dpefm=0.0;
+  DBL small,sabs,o,s,o1,o2,s1,s2,op,sp,ot,st,dmg,z,sigma,tau;
+  DBL e1x,e1y,h,area;
+  YINT ielem,integ,i0,i1,i2,i3,nfail,el1,el2,el1edge,el2edge,flag;
+  YINT nsoft;
+  DBL dpefs;
+  DBL joint_ke; /* joint kinetic energy (i.e. kinetic energy of the four joint nodes) */
+  DBL delta_ke; /* difference between joint_ke and the joint kinetic energy calculated when it first yields */
+  
+  DBL beta;  /* joint orientation angle (0-180) */
+  DBL gamma; /* relative angle between layering and joint element (0-90) */
+  
+  //! Assigning strength input values to "peak" values
+  DBL dpeftp = dpeft;
+  DBL dpegfp = dpegf;
+  DBL dpegsp = dpegs;
+  DBL C; /* exponent for power-law function */
+  
+  //DBL Fxi0;
+  //DBL Fyi0;
+  
+  /*static FILE *out1=FILENULL;
+  if(out1 == FILENULL)
+  { out1=fopen("Yfd2JOINTS.txt", "a");
+  }*/
+  
+
+
+
+
+
+
+
+
+
+  small=EPSILON; 
+  for(ielem=0;ielem<nelem;ielem++)
+  { if(i1elpr[ielem]==iprop)
+    {// if((ielem%75)==0){i1elpr[ielem]=iprop-YIPROPMAX;}
+      dpefs=d1elfs[ielem];
+      i0=i2elto[0][ielem];
+      i1=i2elto[1][ielem];
+      i2=i2elto[2][ielem];
+      i3=i2elto[3][ielem];
+    
+      
+      e1x=RP5*(d1nccx[i1]+d1nccx[i2]-d1nccx[i0]-d1nccx[i3]);
+      e1y=RP5*(d1nccy[i1]+d1nccy[i2]-d1nccy[i0]-d1nccy[i3]);
+      h=SQRT(e1x*e1x+e1y*e1y);
+      e1x=e1x/(h+small);
+      e1y=e1y/(h+small);
+      s1=(d1nccy[i0]-d1nccy[i3])*e1y+(d1nccx[i0]-d1nccx[i3])*e1x;
+      s2=(d1nccy[i1]-d1nccy[i2])*e1y+(d1nccx[i1]-d1nccx[i2])*e1x;
+      o1=(d1nccy[i0]-d1nccy[i3])*e1x-(d1nccx[i0]-d1nccx[i3])*e1y;
+      o2=(d1nccy[i1]-d1nccy[i2])*e1x-(d1nccx[i1]-d1nccx[i2])*e1y;
+      //! Anisotropic fracture model
+      if(dusaf>0.0)
+      {
+        //! Calculation of joint orientation (i.e. angle beta)
+        //beta = atan( (((d1nccy[i1]+d1nccy[i2])/2)-((d1nccy[i0]+d1nccy[i3])/2))/(((d1nccx[i1]+d1nccx[i2])/2)-((d1nccx[i0]+d1nccx[i3])/2))) * 180/MYPI;
+        beta = atan((d1nccy[i1]-d1nccy[i0])/(d1nccx[i1]-d1nccx[i0])) * 180/MYPI; // simplified formula
+        if (beta < 0.0)
+        { beta = beta + 180.0; }
+      
+        //! Calculation of relative angle between layering and joint element
+        gamma = ABS(dpealp - beta);
+        if(gamma > 90.0)
+        { 
+          gamma = 180.0 - gamma; 
+        }
+        
+        //! Power-law variation with exponent C = IUSAF
+        C = dusaf;
+        dpeft = dpeftr + (dpeftp-dpeftr) * pow((gamma/90.0),C);
+        dpegf = dpegfr + (dpegfp-dpegfr) * pow((gamma/90.0),C);
+        dpegs = dpegsr + (dpegsp-dpegsr) * pow((gamma/90.0),C);
+        // dpefs is updated below according to Mohr-Coulomb */        
+
+      }
+      
+      op=R2*h*dpeft/dpepe;
+      sp=R2*h*dpefs/dpepe;
+      ot=MAXIM(EPSILON,(R3*dpegf/dpeft));
+      st=MAXIM(EPSILON,(R3*dpegs/dpefs));
+      //ot=MAXIM((R2*op),(R3*dpegf/dpeft));
+      //st=MAXIM((R2*sp),(R3*dpegs/dpefs));
+      
+      //! Use "cohesive" DFN properties to calculate op, sp, ot, and st
+      if((iusefn == 2) && (i1edfnf[ielem]==1))
+      { //! If joint element belongs to DFN
+        op=R2*h*ddfnft/dpepe;
+        sp=R2*h*dpefs/dpepe;
+        ot=MAXIM(EPSILON,(R3*ddfngf/ddfnft));
+        st=MAXIM(EPSILON,(R3*ddfngs/dpefs));
+        // dpefs is updated below according to Mohr-Coulomb 
+      }
+      
+      nfail=0;
+      nsoft=0;
+      
+      el1=i2elnext[0][ielem];     /* 1st element next to the joint */
+      el2=i2elnext[1][ielem];     /* 2nd element next to the joint */
+      el1edge=i2elnext[2][ielem]; /* edge number (0,1,2) of the 1st element (el1) */
+      el2edge=i2elnext[3][ielem]; /* edge number (0,1,2) of the 2nd element (el2) */
+      if((el1==-1)||(el2==-1)) continue; /* no need to do further computations if this is an external edge */
+      //! Applying mixed DFN (i.e., DFN type 3) using the flag assigned to the joint element
+      if(iusefn == 3)
+      { if(i1edft[ielem] == 1) //! Broken-type DFN crack
+      	{ i1elpr[ielem]=iprop-YIPROPMAX;
+          d1ebrkf[ielem]=5.0;
+          //! For hydrofrac
+          i2noid[0][i0]=i1;
+          i2noid[1][i1]=i0;
+          i2noid[0][i2]=i3;
+          i2noid[1][i3]=i2;
+        }
+        if(i1edft[ielem] == 2) //! Cohesive-type DFN crack
+        { op=R2*h*ddfnft/dpepe;
+          sp=R2*h*dpefs/dpepe;
+          ot=MAXIM(EPSILON,(R3*ddfngf/ddfnft));
+          st=MAXIM(EPSILON,(R3*ddfngs/dpefs));
+          // dpefs is updated below according to Mohr-Coulomb
+        }
+      }
+         
+      // 体单元塑性状态（外部每步更新）
+     // 每个体单元的等效塑性应变（或塑性耗散能）
+
+// 门控控制参数
+DBL epeq_crit=0.001;         // 开始触发界面软化的塑性阈值   取材料屈服后、但还没明显局部化时的等效塑性应变。常见范围 0.0005–0.002
+DBL epeq_band=0.2*epeq_crit;         // 平滑过渡带宽 Δεp 控制 α 从 0 增长到 1 的“带宽”，越大过渡越缓，初值可取 epeq_band ≈ (0.5–1.0) × epeq_crit，这样 α 在 epeq_crit 附近有一个平滑的 S 型增长。如果想让界面延迟更久，取大一些
+DBL epeqL = EPS[0][el1];
+DBL epeqR = EPS[0][el2];
+DBL epeq_edge = MAXIM(epeqL, epeqR); // 或平均
+
+// --- smooth plasticity weight: w ∈ [0,1], S-shaped unlock around epeq_crit ---
+DBL w_arg = (epeq_edge - epeq_crit) / (epeq_band + EPSILON);
+DBL w = 0.5*(1.0 + tanh(w_arg));       // soft gating (α)
+
+
+
+// --- damage evolution parameters (new) ---
+DBL k_rate   = 1.0;                  // global scale; calibrate to match Gc   初值1.0
+DBL p_exp    = 1.0;                    // displacement sensitivity (1–2)
+DBL q_exp    = 3.0;                    // plasticity sensitivity (2–4)
+DBL k_floor  = 1e-3*k_rate;            // tiny floor once beyond peak; 1e-4–1e-2*k_rate
+
+      //! Performing excavation: set joint element state to broken if between at least one "excavated" element
+      if((i1pexc[i1elpr[el1]]==1)||(i1pexc[i1elpr[el2]]==1))
+      { i1elpr[ielem]=iprop-YIPROPMAX; 
+        d1ebrkf[ielem]=4.0;
+        if(iusehf==1)
+	{ //! For hydrofrac
+          i2noid[0][i0]=i1;
+          i2noid[1][i1]=i0;
+          i2noid[0][i2]=i3;
+          i2noid[1][i3]=i2;
+        }
+      }
+      else 
+      {
+      //Fxi0=0.0;
+      //Fyi0=0.0;
+      for(integ=0;integ<3;integ++)
+      {
+        
+        flag=0;
+        if(integ==0)
+        { o=o1; s=s1;
+        }
+        else if(integ==2)
+        { o=o2; s=s2;
+        }
+        else
+        { o=RP5*(o1+o2); s=RP5*(s1+s2);
+        }
+        sabs=ABS(s);
+
+
+if ((o > op) && (sabs > sp)) {
+  dmg=SQRT(((o-op)/ot)*((o-op)/ot)+((sabs-sp)/st)*((sabs-sp)/st));
+} else if (o > op) {
+  dmg=(o-op)/ot;
+} else if (sabs > sp) {
+  dmg=(sabs-sp)/st;
+}
+else
+        { dmg=R0;
+        }
+
+          if((integ==0) && (dmg>=d2dmg[0][ielem])) 
+          {  flag=1;
+            d2dmg[0][ielem]=dmg;
+            }
+          else if((integ==1) && (dmg>=d2dmg[1][ielem])) 
+          { flag=1;
+            d2dmg[1][ielem]=dmg;
+            }
+          else if((integ==2) && (dmg>=d2dmg[2][ielem])) 
+          { flag=1;
+            d2dmg[2][ielem]=dmg;
+            }
+
+
+
+
+// --- equivalent separation for geometric drive (choose form consistent with your law) ---
+    // Option A: use projections (o for normal opening; sabs for shear), weighted:
+    DBL alpha_n = 1.0, alpha_s = 1.0;   // tune if anisotropic mix needed
+    DBL del_bar = SQRT(alpha_n*o*o + alpha_s*sabs*sabs);
+    ////DBL del_c   = MAXIM(EPSILON, MAXIM(op, sp));   // scale for non-dimensionalization
+
+    //// --- geometric and plastic drive terms for rate ---
+    ////DBL geom = pow(MAXIM(EPSILON, del_bar/del_c), p_exp);
+    DBL del_bar_n;
+if (sabs > o) {del_bar_n = del_bar / (sp + EPSILON);} else {del_bar_n = del_bar / (op + EPSILON);}
+DBL geom = pow(del_bar_n, p_exp);
+
+    DBL plast = pow(w, q_exp);
+
+    // --- previous damage state: reuse d2eldmg as "peak" storage; add D store if you prefer clarity ---
+    DBL D_prev = d2D[integ][ielem];  // previously used for dmg peak; reinterpret as D peak
+
+    // --- damage rate with soft gating ---
+    DBL D_dot = k_rate * geom * plast;
+
+    // --- tiny floor beyond peak to avoid infinite platform (still geometry-controlled) ---
+    if (((o >= op) || (sabs >= sp))) {
+        D_dot = MAXIM(D_dot, k_floor * geom);
+    }
+     if (flag==0) { /* unloading branch */
+        D_dot = k_rate * geom * plast * (-1.0);
+        //D_dot = 0.0;
+
+
+    }
+    // --- integrate and clamp ---
+    DBL D = D_prev + D_dot * dcstec;
+    if (fabs(1.0 - D) < 1.0e-2)  D = 1.0;
+    if (D < 0.0) D = 0.0;
+    if (D > 1.0){
+D = 1.0;
+
+
+    } 
+// --- hysteresis peak tracking (loading branch) ---
+    if (D >= d2eldmg[integ][ielem]) {
+        d2eldmg[integ][ielem] = D;
+    }
+
+     
+       d2D[integ][ielem] = D;
+
+
+
+    // --- compute z from D (replace dmg→D everywhere) ---
+    if(iusehy==0) {
+        z = (R1 - ((dpefa+dpefb-R1)/(dpefa+dpefb)) *
+            exp(D*(dpefa+dpefc*dpefb)/((dpefa+dpefb)*(R1-dpefa-dpefb))))
+            * (dpefa*(R1-D) + dpefb*pow((R1-D),dpefc));
+    } else {
+        // Loading branch (peak update already done above)
+        DBL Dpeak = d2eldmg[integ][ielem];
+        z = (R1 - ((dpefa+dpefb-R1)/(dpefa+dpefb)) *
+            exp(Dpeak*(dpefa+dpefc*dpefb)/((dpefa+dpefb)*(R1-dpefa-dpefb))))
+            * (dpefa*(R1-Dpeak) + dpefb*pow((R1-Dpeak), dpefc));
+
+        // Unloading branch (keep your linear scaling idea, swap dmg→D)
+        if (D < Dpeak) {
+            //DBL scale = (op + D*ot) / (op + Dpeak*ot); // mirrors your ((op + dmg*ot)/(op + dmg_peak*ot))
+           DBL scale =  D /  Dpeak;
+           
+            z *= scale;
+        }
+    }
+
+
+
+
+    /* 8) 统计“软化检测计数”（保留你的 nsoft 用法：超过一定次数登记软化事件）
+      原来是 dmg>0 的三种分支里递增；现在用“几何已经跨峰值”判断递增，
+      并保留你登记 i1esft[], d1etsft[], KE等的逻辑。 */
+/* 软化检测：几何已跨峰值（统一使用 op, sp） */
+if ((o > op) && (sabs > sp)) {
+
+    nsoft = nsoft + 1;
+    if ((nsoft > 2) && (i1esftf[ielem] == 0)) {
+        i1esft[*nesft] = ielem;
+        d1etsft[*nesft] = dctime;
+        d1etmke[ielem] = dctime;
+        d2ecsft[0][*nesft] = (d1nccx[i0]+d1nccx[i1]+d1nccx[i2]+d1nccx[i3])/R4;
+        d2ecsft[1][*nesft] = (d1nccy[i0]+d1nccy[i1]+d1nccy[i2]+d1nccy[i3])/R4;
+        d1eike[ielem] = 0.5*(d1nmct[i0]*(d1nvcx[i0]*d1nvcx[i0]+d1nvcy[i0]*d1nvcy[i0])+
+                             d1nmct[i1]*(d1nvcx[i1]*d1nvcx[i1]+d1nvcy[i1]*d1nvcy[i1])+
+                             d1nmct[i2]*(d1nvcx[i2]*d1nvcx[i2]+d1nvcy[i2]*d1nvcy[i2])+
+                             d1nmct[i3]*(d1nvcx[i3]*d1nvcx[i3]+d1nvcy[i3]*d1nvcy[i3]));
+        d1etike[ielem] = dctime;
+        i1esftf[ielem] = 1;
+        (*nesft)++;
+        (*netsft)++;
+    }
+} else if (o > op) {
+  
+    nsoft = nsoft + 1;
+    if ((nsoft > 2) && (i1esftf[ielem] == 0)) {
+        i1esft[*nesft] = ielem;
+        d1etsft[*nesft] = dctime;
+        d1etmke[ielem] = dctime;
+        d2ecsft[0][*nesft] = (d1nccx[i0]+d1nccx[i1]+d1nccx[i2]+d1nccx[i3])/R4;
+        d2ecsft[1][*nesft] = (d1nccy[i0]+d1nccy[i1]+d1nccy[i2]+d1nccy[i3])/R4;
+        d1eike[ielem] = 0.5*(d1nmct[i0]*(d1nvcx[i0]*d1nvcx[i0]+d1nvcy[i0]*d1nvcy[i0])+
+                             d1nmct[i1]*(d1nvcx[i1]*d1nvcx[i1]+d1nvcy[i1]*d1nvcy[i1])+
+                             d1nmct[i2]*(d1nvcx[i2]*d1nvcx[i2]+d1nvcy[i2]*d1nvcy[i2])+
+                             d1nmct[i3]*(d1nvcx[i3]*d1nvcx[i3]+d1nvcy[i3]*d1nvcy[i3]));
+        d1etike[ielem] = dctime;
+        i1esftf[ielem] = 2;
+        (*nesft)++;
+        (*netsft)++;
+    }
+} else if (sabs > sp) {
+  
+    nsoft = nsoft + 1;
+    if ((nsoft > 2) && (i1esftf[ielem] == 0)) {
+        i1esft[*nesft] = ielem;
+        d1etsft[*nesft] = dctime;
+        d1etmke[ielem] = dctime;
+        d2ecsft[0][*nesft] = (d1nccx[i0]+d1nccx[i1]+d1nccx[i2]+d1nccx[i3])/R4;
+        d2ecsft[1][*nesft] = (d1nccy[i0]+d1nccy[i1]+d1nccy[i2]+d1nccy[i3])/R4;
+        d1eike[ielem] = 0.5*(d1nmct[i0]*(d1nvcx[i0]*d1nvcx[i0]+d1nvcy[i0]*d1nvcy[i0])+
+                             d1nmct[i1]*(d1nvcx[i1]*d1nvcx[i1]+d1nvcy[i1]*d1nvcy[i1])+
+                             d1nmct[i2]*(d1nvcx[i2]*d1nvcx[i2]+d1nvcy[i2]*d1nvcy[i2])+
+                             d1nmct[i3]*(d1nvcx[i3]*d1nvcx[i3]+d1nvcy[i3]*d1nvcy[i3]));
+        d1etike[ielem] = dctime;
+        i1esftf[ielem] = 3;
+        (*nesft)++;
+        (*netsft)++;
+    }
+}
+
+
+
+/* 9) 断裂判据：用 D≥1 代替原 dmg≥1；其余登记逻辑保留 */
+if (D >= R1) /* joint element broken */ 
+{
+    nfail = nfail + 1;
+    if ((nfail > 1) && (i1elpr[ielem] >= 0)) {
+        i1elpr[ielem] = iprop - YIPROPMAX;
+        i1ebrk[*nebrk] = ielem;
+        d1etbrk[*nebrk] = dctime;
+
+        /* Mode 分类仍用你的 o/sabs 与残余门槛判据 */
+        if ((o >= (op + ot)) && (sabs >= (sp + st))) {       // Mode I + II
+            d1ebrkf[ielem] = 3.0;
+        } else if (o >= (op + ot)) {                         // Mode I
+            d1ebrkf[ielem] = 1.0;
+        } else if (sabs >= (sp + st)) {                      // Mode II
+            d1ebrkf[ielem] = 2.0;
+        } else {                                             // 混合模式（你的向量式）
+            d1ebrkf[ielem] = 1.0 + (sabs - sp) / (st);
+        }
+
+        /* 断裂位置与长度登记（保留） */
+        d2ecbrk[0][*nebrk]=(d1nccx[i0]+d1nccx[i1]+d1nccx[i2]+d1nccx[i3])/R4;
+        d2ecbrk[1][*nebrk]=(d1nccy[i0]+d1nccy[i1]+d1nccy[i2]+d1nccy[i3])/R4;
+        d2ecbrk_NEW[0][ielem]=(d1nccx[i0]+d1nccx[i1]+d1nccx[i2]+d1nccx[i3])/R4;
+        d2ecbrk_NEW[1][ielem]=(d1nccy[i0]+d1nccy[i1]+d1nccy[i2]+d1nccy[i3])/R4;
+        d1elbrk[*nebrk]=SQRT((d1nccx[i0]-d1nccx[i1])*(d1nccx[i0]-d1nccx[i1])+(d1nccy[i0]-d1nccy[i1])*(d1nccy[i0]-d1nccy[i1]));
+        (*nebrk)++;
+        (*netbrk)++;
+
+        //! For hydrofrac
+        i2noid[0][i0]=i1;
+        i2noid[1][i1]=i0;
+        i2noid[0][i2]=i3;
+        i2noid[1][i3]=i2;
+    }
+    /* 将当前 D 钳到 1（与原 dmg=R1 一致） */
+    D = R1;
+}
+
+    // --- intact/broken edges logic unchanged, just use D instead of dmg for the condition ---
+    if (i0!=i3 && i1!=i2) {
+        if (D >= R1) {
+            i2eledge[el1edge][el1] = -1;
+            i2eledge[el2edge][el2] = -1;
+        } else {
+            i2eledge[el1edge][el1] = 1;
+            i2eledge[el2edge][el2] = 1;
+        }
+    }
+
+
+
+
+
+
+  /* --- 法向应力 σ 更新 --- */
+if (o < R0) {  
+    // 压缩状态：线性接触刚度
+    sigma = R2 * o * dpeft / op;   // op_eff = op*(1-κw)，若不用微前移则直接 op
+} 
+else if (o > op) {  
+    // 超过峰值：由退化因子 z(D) 控制
+    sigma = dpeft * z;  
+} 
+else {  
+    // 峰值前：二次多项式上升段
+    DBL ratio = o / op;
+    sigma = (R2*ratio - ratio*ratio) * z * dpeft;
+}
+
+/* --- Mohr-Coulomb 剪切强度更新 --- */
+if (dpeco > R0) {
+    if (sigma > R0) {
+        // 拉开状态
+        if (dusaf > 0) { // 各向异性修正
+            C = dusaf;
+            dpefs = dpecor + (dpeco - dpecor) * pow((gamma/90.0), C);
+        } else {
+            dpefs = dpeco;
+        }
+        // DFN 裂缝覆盖
+        if (((iusefn == 2) && (i1edfnf[ielem] == 1)) || ((iusefn == 3) && (i1edft[ielem] == 2))) {
+            dpefs = ddfnco;
+        }
+    } else {
+        // 压缩状态
+        if (dusaf > 0) {
+            C = dusaf;
+            dpefs = dpecor + (dpeco - dpecor) * pow((gamma/90.0), C)
+                  - sigma * (dpefrrd + (dpefr - dpefrrd) * pow((gamma/90.0), C));
+        } else {
+            dpefs = dpeco - sigma * dpefr;
+        }
+        // DFN 裂缝覆盖
+        if (((iusefn == 2) && (i1edfnf[ielem] == 1)) || ((iusefn == 3) && (i1edft[ielem] == 2))) {
+            dpefs = ddfnco - sigma * dpefr;
+        }
+    }
+}
+
+/* --- 剪切应力 τ 更新 --- */
+if ((sigma > R0) && (sabs > sp)) {
+    tau = z * dpefs;
+} 
+else if (sigma > R0) {
+    DBL ratio = sabs / sp;
+    tau = (R2*ratio - ratio*ratio) * z * dpefs;
+} 
+else if (sabs > sp) {
+    tau = z * dpefs - dpefm * sigma;
+} 
+else {
+    DBL ratio = sabs / sp;
+    tau = (R2*ratio - ratio*ratio) * (z * dpefs - dpefm * sigma);
+}
+
+/* 更新 Mohr-Coulomb 剪切强度 */
+d1elfs[ielem] = dpefs;
+
+/* 剪切方向修正 */
+if (s < R0) tau = -tau;
+
+
+    // --- energy accounting (optional but recommended) ---
+    // Ed += (sigma*delta_n_inc + tau*delta_s_inc) - elastic_storage_change;
+    // Ep += solid_plastic_work_increment_from_el1_el2();
+
+
+        
+
+  
+        if(integ==0)  /* nodal forces */
+        { area=h/YR6; /* area=h/6.0; */
+          d1nfcx[i0]=d1nfcx[i0]-area*(tau*e1x-sigma*e1y);
+          d1nfcx[i3]=d1nfcx[i3]+area*(tau*e1x-sigma*e1y);
+          d1nfcy[i0]=d1nfcy[i0]-area*(tau*e1y+sigma*e1x);
+          d1nfcy[i3]=d1nfcy[i3]+area*(tau*e1y+sigma*e1x);
+          /* Element fracture energy */
+          d1efe[ielem]=d1efe[ielem]+dcstec*((-area*(tau*e1x-sigma*e1y))*d1nvcx[i0]+(-area*(tau*e1y+sigma*e1x))*d1nvcy[i0]+
+                        (area*(tau*e1x-sigma*e1y))*d1nvcx[i3]+(area*(tau*e1y+sigma*e1x))*d1nvcy[i3]);
+          
+          /*if(ielem==3)
+          { Fxi0=Fxi0-area*(tau*e1x-sigma*e1y);
+            Fyi0=Fyi0-area*(tau*e1y+sigma*e1x); }*/
+        }
+        else if(integ==1)
+        { area=h/R3;  /* area=h/3.0; */
+          d1nfcx[i0]=d1nfcx[i0]-area*(tau*e1x-sigma*e1y);
+          d1nfcx[i3]=d1nfcx[i3]+area*(tau*e1x-sigma*e1y);
+          d1nfcy[i0]=d1nfcy[i0]-area*(tau*e1y+sigma*e1x);
+          d1nfcy[i3]=d1nfcy[i3]+area*(tau*e1y+sigma*e1x);
+          d1nfcx[i1]=d1nfcx[i1]-area*(tau*e1x-sigma*e1y);
+          d1nfcx[i2]=d1nfcx[i2]+area*(tau*e1x-sigma*e1y);
+          d1nfcy[i1]=d1nfcy[i1]-area*(tau*e1y+sigma*e1x);
+          d1nfcy[i2]=d1nfcy[i2]+area*(tau*e1y+sigma*e1x);
+          /* Element fracture energy */
+          d1efe[ielem]=d1efe[ielem]+dcstec*((-area*(tau*e1x-sigma*e1y))*d1nvcx[i0]+(-area*(tau*e1y+sigma*e1x))*d1nvcy[i0]+
+                       (-area*(tau*e1x-sigma*e1y))*d1nvcx[i1]+(-area*(tau*e1y+sigma*e1x))*d1nvcy[i1]+
+                       (+area*(tau*e1x-sigma*e1y))*d1nvcx[i2]+(+area*(tau*e1y+sigma*e1x))*d1nvcy[i2]+
+                       (+area*(tau*e1x-sigma*e1y))*d1nvcx[i3]+(+area*(tau*e1y+sigma*e1x))*d1nvcy[i3]);
+
+          /*if(ielem==3)
+          { Fxi0=Fxi0-area*(tau*e1x-sigma*e1y);  
+            Fyi0=Fyi0-area*(tau*e1y+sigma*e1x); }*/
+          //if(ielem==3)
+          //{ fprintf(out1,"%.6f \t %.6f \t %.6f \n",dctime,sigma,tau); }
+        }
+        else
+        { area=h/YR6; /* area=h/6.0; */
+          d1nfcx[i1]=d1nfcx[i1]-area*(tau*e1x-sigma*e1y);
+          d1nfcx[i2]=d1nfcx[i2]+area*(tau*e1x-sigma*e1y);
+          d1nfcy[i1]=d1nfcy[i1]-area*(tau*e1y+sigma*e1x);
+          d1nfcy[i2]=d1nfcy[i2]+area*(tau*e1y+sigma*e1x);
+          /* Element fracture energy */
+          d1efe[ielem]=d1efe[ielem]+dcstec*((-area*(tau*e1x-sigma*e1y))*d1nvcx[i1]+(-area*(tau*e1y+sigma*e1x))*d1nvcy[i1]+
+                       (+area*(tau*e1x-sigma*e1y))*d1nvcx[i2]+(+area*(tau*e1y+sigma*e1x))*d1nvcy[i2]);
+        }
+      }
+      }
+      /* If joint is yielded compute differential kinetic energy */
+      if(i1esftf[ielem]>0)
+      { joint_ke = 0.5*(d1nmct[i0]*(d1nvcx[i0]*d1nvcx[i0]+d1nvcy[i0]*d1nvcy[i0])+
+                        d1nmct[i1]*(d1nvcx[i1]*d1nvcx[i1]+d1nvcy[i1]*d1nvcy[i1])+
+                        d1nmct[i2]*(d1nvcx[i2]*d1nvcx[i2]+d1nvcy[i2]*d1nvcy[i2])+
+                        d1nmct[i3]*(d1nvcx[i3]*d1nvcx[i3]+d1nvcy[i3]*d1nvcy[i3]));
+        delta_ke = joint_ke - d1eike[ielem];
+        /* If the differential kinetic energy is greater than that from previous timestep update the joint differential kin energy */
+        if(delta_ke > d1edke[ielem])
+        { d1edke[ielem] = delta_ke; 
+          d1etmke[ielem] = dctime;
+        }
+        if(iusesm == 1) //! Use maximum time window duration
+        { if (dctime >= d1etike[ielem] + dctwle)
+          { d1eike[ielem] = joint_ke;
+            d1etike[ielem] = dctime; 
+        } }
+      }
+      if(iusesm == 2) //! Record energy at the time of failure
+      { if(d1ebrkf[ielem]>0)
+        { joint_ke = 0.5*(d1nmct[i0]*(d1nvcx[i0]*d1nvcx[i0]+d1nvcy[i0]*d1nvcy[i0])+
+                          d1nmct[i1]*(d1nvcx[i1]*d1nvcx[i1]+d1nvcy[i1]*d1nvcy[i1])+
+                          d1nmct[i2]*(d1nvcx[i2]*d1nvcx[i2]+d1nvcy[i2]*d1nvcy[i2])+
+                          d1nmct[i3]*(d1nvcx[i3]*d1nvcx[i3]+d1nvcy[i3]*d1nvcy[i3]));
+          d1edke[ielem] = joint_ke;
+          d1etmke[ielem] = dctime;
+      } }
+    }
+  }
+}
+
+static void Yfd2JOINTS_ECZM(  /* joint element */
+  YINT   nelem, YINT   iprop,
+  DBL   dpeft, DBL   dpegf, DBL   dpegs,
+  DBL   dpeco, DBL   dpefr, DBL   dpepe,
+  DBL *d1nccx, DBL *d1nccy, DBL *d1nfcx, DBL *d1nfcy,
+  DBL *d1nvcx, DBL *d1nvcy,
+  YINT *i1elpr, YINT **i2elto, DBL *d1elfs,
+  DBL dctime, DBL dcstec,
+  YINT  *nebrk, YINT  *netbrk, YINT *i1ebrk,
+  DBL  **d2ecbrk, DBL **d2ecbrk_NEW, DBL *d1etbrk, DBL *d1elbrk, DBL *d1efe,
+  YINT  *nesft, YINT  *netsft, YINT *i1esft,
+  DBL **d2ecsft, DBL *d1etsft, YINT *i1esftf, DBL *d1ebrkf,
+  DBL *d1eike, DBL *d1edke, DBL *d1nmct, DBL *d1etmke,
+  YINT **i2elnext, YINT **i2eledge,
+  YINT *i1pexc,
+  DBL dusaf, DBL dpealp, DBL dpecor, DBL dpefrrd, DBL dpeftr, DBL dpegfr, DBL dpegsr,
+  YINT *i1nowe, YINT **i2noid,
+  YINT iusefn, YINT *i1edfnf, DBL ddfnft, DBL ddfnco, DBL ddfngf, DBL ddfngs, YINT iusehf,
+  YINT *i1edft, DBL *d1etike, YINT iusesm, DBL dctwle,
+  YINT iusehy, DBL **d2eldmg,
+
+   DBL **sigma00, DBL **sigma10, DBL **sigma11, DBL *d1area,DBL  ncstep,DBL *d1inst,DBL *d1inss,YINT *i1elprtmp,YINT *i1elfr ,YINT *iuptrimesh ,YINT *i1remeshf
+  ){
+   DBL dpefa=0.63;
+  DBL dpefb=1.8;
+  DBL dpefc=6.0;
+  DBL dpefm=0.0;
+  DBL sabs;
+  DBL o;
+  DBL s;
+  DBL ot;
+  DBL st;
+  DBL dmg;
+  DBL z;
+  DBL sigma=0.0;
+  DBL tau=0.0;
+  DBL sp;
+  DBL op;
+  DBL s2;
+  DBL s1;
+  DBL o1;
+  DBL o2;
+  DBL small=EPSILON;
+   DBL e1x,e1y,h,area;
+  YINT ielem,integ,i0,i1,i2,i3,nfail,el1,el2,el1edge,el2edge;
+  YINT nsoft,i,j;
+  DBL dpefs;
+  DBL joint_ke; /* joint kinetic energy (i.e. kinetic energy of the four joint nodes) */
+  DBL delta_ke; /* difference between joint_ke and the joint kinetic energy calculated when it first yields */
+  
+  DBL beta;  /* joint orientation angle (0-180) */
+  DBL gamma; /* relative angle between layering and joint element (0-90) */
+  DBL Tedge[2][2],TT0[2][2],TT1[2][2];
+  //! Assigning strength input values to "peak" values
+  DBL dpeftp = dpeft;
+  DBL dpegfp = dpegf;
+  DBL dpegsp = dpegs;
+  DBL C; /* exponent for power-law function */
+
+  small=EPSILON; 
+  for(ielem=0;ielem<nelem;ielem++)
+  { 
+    
+    
+    if((i1elpr[ielem]==iprop))
+    {// if((ielem%75)==0){i1elpr[ielem]=iprop-YIPROPMAX;}
+      dpefs=d1elfs[ielem];
+      i0=i2elto[0][ielem];
+      i1=i2elto[1][ielem];
+      i2=i2elto[2][ielem];
+      i3=i2elto[3][ielem];     
+
+      el1=i2elnext[0][ielem];     /* 1st element next to the joint */
+      el2=i2elnext[1][ielem];     /* 2nd element next to the joint */
+      el1edge=i2elnext[2][ielem]; /* edge number (0,1,2) of the 1st element (el1) */
+      el2edge=i2elnext[3][ielem]; /* edge number (0,1,2) of the 2nd element (el2) */
+      
+      if((el1==-1)||(el2==-1)) continue; /* no need to do further computations if this is an external edge */
+             e1x=RP5*(d1nccx[i1]+d1nccx[i2]-d1nccx[i0]-d1nccx[i3]);
+      e1y=RP5*(d1nccy[i1]+d1nccy[i2]-d1nccy[i0]-d1nccy[i3]);
+      h=SQRT(e1x*e1x+e1y*e1y);
+      e1x=e1x/(h+small);//qiexiang
+      e1y=e1y/(h+small);
+      s1=(d1nccy[i0]-d1nccy[i3])*e1y+(d1nccx[i0]-d1nccx[i3])*e1x;
+      s2=(d1nccy[i1]-d1nccy[i2])*e1y+(d1nccx[i1]-d1nccx[i2])*e1x;
+      o1=(d1nccy[i0]-d1nccy[i3])*e1x-(d1nccx[i0]-d1nccx[i3])*e1y;
+      o2=(d1nccy[i1]-d1nccy[i2])*e1x-(d1nccx[i1]-d1nccx[i2])*e1y;
+      //! Anisotropic fracture model
+      if(dusaf>0.0)
+      {
+        //! Calculation of joint orientation (i.e. angle beta)
+        //beta = atan( (((d1nccy[i1]+d1nccy[i2])/2)-((d1nccy[i0]+d1nccy[i3])/2))/(((d1nccx[i1]+d1nccx[i2])/2)-((d1nccx[i0]+d1nccx[i3])/2))) * 180/MYPI;
+        beta = atan((d1nccy[i1]-d1nccy[i0])/(d1nccx[i1]-d1nccx[i0])) * 180/MYPI; // simplified formula
+        if (beta < 0.0)
+        { beta = beta + 180.0; }
+      
+        //! Calculation of relative angle between layering and joint element
+        gamma = ABS(dpealp - beta);
+        if(gamma > 90.0)
+        { 
+          gamma = 180.0 - gamma; 
+        }
+        
+        //! Power-law variation with exponent C = IUSAF
+        C = dusaf;
+        dpeft = dpeftr + (dpeftp-dpeftr) * pow((gamma/90.0),C);
+        dpegf = dpegfr + (dpegfp-dpegfr) * pow((gamma/90.0),C);
+        dpegs = dpegsr + (dpegsp-dpegsr) * pow((gamma/90.0),C);
+      }
+      op=R2*h*dpeft/dpepe;
+      sp=R2*h*dpefs/dpepe;
+      ot=MAXIM(EPSILON,(R3*dpegf/dpeft));
+      st=MAXIM(EPSILON,(R3*dpegs/dpefs));
+      //ot=MAXIM((R2*op),(R3*dpegf/dpeft));
+      //st=MAXIM((R2*sp),(R3*dpegs/dpefs));
+      
+      //! Use "cohesive" DFN properties to calculate op, sp, ot, and st
+      if((iusefn == 2) && (i1edfnf[ielem]==1))
+      { //! If joint element belongs to DFN
+        op=R2*h*ddfnft/dpepe;
+        sp=R2*h*dpefs/dpepe;
+        ot=MAXIM(EPSILON,(R3*ddfngf/ddfnft));
+        st=MAXIM(EPSILON,(R3*ddfngs/dpefs));
+        // dpefs is updated below according to Mohr-Coulomb 
+      }
+      
+      nfail=0;
+      nsoft=0;
+                TT0[0][0] = sigma00[0][el1];
+                 TT0[1][1] =sigma11[0][el1];
+                 TT0[0][1] = sigma10[0][el1];
+                 TT0[1][0] = sigma10[0][el1];
+                TT1[0][0] = sigma00[0][el2];
+                 TT1[1][1] =sigma11[0][el2];
+                 TT1[0][1] = sigma10[0][el2];
+                 TT1[1][0] = sigma10[0][el2];
+
+      for(i=0;i<2;i++)   
+      { for(j=0;j<2;j++)   
+        { Tedge[i][j]=0.0;
+          Tedge[i][j]=((d1area[el1]*TT0[i][j])+(d1area[el2]*TT1[i][j]))/(d1area[el1]+d1area[el2]);
+        }
+      }
+          
+          // 法向应力 σ_n = n · σ · n
+          DBL   sigma_n = (-e1y) * (Tedge[0][0] * (-e1y)+ Tedge[0][1] * e1x) 
+                        + e1x * (Tedge[1][0] * (-e1y) + Tedge[1][1] * e1x);
+
+          // 切向应力 τ_s = t · σ · n
+          DBL  tau_s = e1x * (Tedge[0][0] * (-e1y) + Tedge[0][1] * e1x) 
+                     + e1y * (Tedge[1][0] * (-e1y) + Tedge[1][1] * e1x);
+
+if(((sigma_n >= dpeft)||(fabs(tau_s) >= dpefs))||(i1elprtmp[ielem]==1111)||(i1elfr[ielem]==1))
+    {
+                        if(i1elprtmp[ielem]<0){
+                        i1remeshf[i2elto[0][ielem]]=1;
+                        i1remeshf[i2elto[1][ielem]]=1;
+                        i1remeshf[i2elto[2][ielem]]=1;
+                        i1remeshf[i2elto[3][ielem]]=1;
+                        
+
+                        d1inst[ielem]=sigma_n;
+                        d1inss[ielem]=tau_s;
+                         i1elfr[ielem]=1;
+                        i1elprtmp[ielem]=1111;
+      if(sigma_n>0){d1inst[ielem]=MINIM(dpeft,d1inst[ielem]);}
+      if(tau_s>0){
+        d1inss[ielem]=MINIM(dpefs,d1inss[ielem]);}
+      if(tau_s<0){
+        d1inss[ielem]=MAXIM(-dpefs,d1inss[ielem]);}
+                       (*iuptrimesh)=1;
+                      
+                        }
+
+
+      //! Applying mixed DFN (i.e., DFN type 3) using the flag assigned to the joint element
+      if(iusefn == 3)
+      { if(i1edft[ielem] == 1) //! Broken-type DFN crack
+      	{ i1elpr[ielem]=iprop-YIPROPMAX;
+          d1ebrkf[ielem]=5.0;
+          //! For hydrofrac
+          i2noid[0][i0]=i1;
+          i2noid[1][i1]=i0;
+          i2noid[0][i2]=i3;
+          i2noid[1][i3]=i2;
+        }
+        if(i1edft[ielem] == 2) //! Cohesive-type DFN crack
+        { op=R2*h*ddfnft/dpepe;
+          sp=R2*h*dpefs/dpepe;
+          ot=MAXIM(EPSILON,(R3*ddfngf/ddfnft));
+          st=MAXIM(EPSILON,(R3*ddfngs/dpefs));
+          // dpefs is updated below according to Mohr-Coulomb
+        }
+      }
+                  
+      //! Performing excavation: set joint element state to broken if between at least one "excavated" element
+      if((i1pexc[i1elpr[el1]]==1)||(i1pexc[i1elpr[el2]]==1))
+      { i1elpr[ielem]=iprop-YIPROPMAX; 
+        d1ebrkf[ielem]=4.0;
+        if(iusehf==1)
+	{ //! For hydrofrac
+          i2noid[0][i0]=i1;
+          i2noid[1][i1]=i0;
+          i2noid[0][i2]=i3;
+          i2noid[1][i3]=i2;
+        }
+      }
+      else 
+      {
+      //Fxi0=0.0;
+      //Fyi0=0.0;
+      for(integ=0;integ<3;integ++)
+      { if(integ==0)
+        { o=o1+(h*d1inst[ielem]/dpepe); s=s1+(h*d1inss[ielem]/dpepe);
+        }
+        else if(integ==2)
+        { o=o2+(h*d1inst[ielem]/dpepe); s=s2+(h*d1inss[ielem]/dpepe);
+        }
+        else
+        { o=RP5*(o1+o2)+(h*d1inst[ielem]/dpepe); s=RP5*(s1+s2)+(h*d1inss[ielem]/dpepe);
+        }
+        sabs=ABS(s);
+        if((o>op)&&(sabs>sp))
+        { dmg=SQRT(((o-op)/ot)*((o-op)/ot)+((sabs-sp)/st)*((sabs-sp)/st));
+          nsoft=nsoft+1;
+          if((nsoft>2)&&(i1esftf[ielem]==0))  
+          { i1esft[*nesft]=ielem;
+            d1etsft[*nesft]=dctime;
+            d1etmke[ielem]=dctime;
+            d2ecsft[0][*nesft]=(d1nccx[i0]+d1nccx[i1]+d1nccx[i2]+d1nccx[i3])/R4;
+            d2ecsft[1][*nesft]=(d1nccy[i0]+d1nccy[i1]+d1nccy[i2]+d1nccy[i3])/R4;
+            /* Kinetic energy of the joint as soon as it yields */ 
+            d1eike[ielem]= 0.5*(d1nmct[i0]*(d1nvcx[i0]*d1nvcx[i0]+d1nvcy[i0]*d1nvcy[i0])+
+                                d1nmct[i1]*(d1nvcx[i1]*d1nvcx[i1]+d1nvcy[i1]*d1nvcy[i1])+
+                                d1nmct[i2]*(d1nvcx[i2]*d1nvcx[i2]+d1nvcy[i2]*d1nvcy[i2])+
+                                d1nmct[i3]*(d1nvcx[i3]*d1nvcx[i3]+d1nvcy[i3]*d1nvcy[i3]));
+            d1etike[ielem] = dctime; //! initial time of KE monitoring window
+            i1esftf[ielem]=1;
+            (*nesft)++;
+            (*netsft)++;
+          }
+        }
+        else if(o>op)
+        { dmg=(o-op)/ot;
+          nsoft=nsoft+1;
+          if((nsoft>2)&&(i1esftf[ielem]==0))  
+          { 
+            i1esft[*nesft]=ielem;
+            d1etsft[*nesft]=dctime;
+            d1etmke[ielem]=dctime;
+            d2ecsft[0][*nesft]=(d1nccx[i0]+d1nccx[i1]+d1nccx[i2]+d1nccx[i3])/R4;
+            d2ecsft[1][*nesft]=(d1nccy[i0]+d1nccy[i1]+d1nccy[i2]+d1nccy[i3])/R4;
+            /* Kinetic energy of the joint as soon as it yields */ 
+            d1eike[ielem]= 0.5*(d1nmct[i0]*(d1nvcx[i0]*d1nvcx[i0]+d1nvcy[i0]*d1nvcy[i0])+
+                                d1nmct[i1]*(d1nvcx[i1]*d1nvcx[i1]+d1nvcy[i1]*d1nvcy[i1])+
+                                d1nmct[i2]*(d1nvcx[i2]*d1nvcx[i2]+d1nvcy[i2]*d1nvcy[i2])+
+                                d1nmct[i3]*(d1nvcx[i3]*d1nvcx[i3]+d1nvcy[i3]*d1nvcy[i3]));
+            d1etike[ielem] = dctime; //! initial time of KE monitoring window
+            i1esftf[ielem]=2;
+            (*nesft)++;
+            (*netsft)++;
+          }
+        }
+        else if(sabs>sp)
+        { dmg=(sabs-sp)/st;
+          nsoft=nsoft+1;
+          if((nsoft>2)&&(i1esftf[ielem]==0))  
+          { 
+            i1esft[*nesft]=ielem;
+            d1etsft[*nesft]=dctime;
+            d1etmke[ielem]=dctime;
+            d2ecsft[0][*nesft]=(d1nccx[i0]+d1nccx[i1]+d1nccx[i2]+d1nccx[i3])/R4;
+            d2ecsft[1][*nesft]=(d1nccy[i0]+d1nccy[i1]+d1nccy[i2]+d1nccy[i3])/R4;
+            /* Kinetic energy of the joint as soon as it yields */ 
+            d1eike[ielem]= 0.5*(d1nmct[i0]*(d1nvcx[i0]*d1nvcx[i0]+d1nvcy[i0]*d1nvcy[i0])+
+                                d1nmct[i1]*(d1nvcx[i1]*d1nvcx[i1]+d1nvcy[i1]*d1nvcy[i1])+
+                                d1nmct[i2]*(d1nvcx[i2]*d1nvcx[i2]+d1nvcy[i2]*d1nvcy[i2])+
+                                d1nmct[i3]*(d1nvcx[i3]*d1nvcx[i3]+d1nvcy[i3]*d1nvcy[i3]));
+            d1etike[ielem] = dctime; //! initial time of KE monitoring window
+            i1esftf[ielem]=3;
+            (*nesft)++;
+            (*netsft)++;
+          }
+        }
+        else
+        { dmg=R0;
+        }
+        if(dmg>=R1) /* joint element broken */
+        { nfail=nfail+1;
+          if((nfail>1)&&(i1elpr[ielem]>=0))
+          {
+            i1elpr[ielem]=iprop-YIPROPMAX;
+            i1ebrk[*nebrk]=ielem;
+            d1etbrk[*nebrk]=dctime;
+            //i1ebrkf[ielem]=i1esftf[ielem];
+            if((o>=(op+ot))&&(sabs>=(sp+st))) // Mode 1 + mode 2 failure
+            { d1ebrkf[ielem]=3.0; 
+            }
+            else if(o>=(op+ot)) // Mode 1 failure
+            { d1ebrkf[ielem]=1.0; 
+            }
+            else if (sabs>=(sp+st)) // Mode 2 failure
+            { d1ebrkf[ielem]=2.0; 
+            }
+            else 
+            //{ d1ebrkf[ielem]=1.0+(sabs-sp)/(st-sp); } // Mode 1 + mode 2 failure (vectorial sum of s and o overcomes residual value)
+            { d1ebrkf[ielem]=1.0+(sabs-sp)/(st); 
+            } // Mode 1 + mode 2 failure (vectorial sum of s and o overcomes residual value)
+            d2ecbrk[0][*nebrk]=(d1nccx[i0]+d1nccx[i1]+d1nccx[i2]+d1nccx[i3])/R4;
+            d2ecbrk[1][*nebrk]=(d1nccy[i0]+d1nccy[i1]+d1nccy[i2]+d1nccy[i3])/R4;
+            d2ecbrk_NEW[0][ielem]=(d1nccx[i0]+d1nccx[i1]+d1nccx[i2]+d1nccx[i3])/R4;
+            d2ecbrk_NEW[1][ielem]=(d1nccy[i0]+d1nccy[i1]+d1nccy[i2]+d1nccy[i3])/R4;
+            d1elbrk[*nebrk]=SQRT((d1nccx[i0]-d1nccx[i1])*(d1nccx[i0]-d1nccx[i1])+(d1nccy[i0]-d1nccy[i1])*(d1nccy[i0]-d1nccy[i1]));
+            (*nebrk)++;
+            (*netbrk)++;
+            //! For hydrofrac
+             i2noid[0][i0]=i1;
+             i2noid[1][i1]=i0;
+             i2noid[0][i2]=i3;
+             i2noid[1][i3]=i2;
+          }
+          dmg=R1;
+        }
+        
+        /* Specify intact/broken element edges */
+        if(i0!=i3 && i1!=i2)
+        { if(dmg==R1)
+          { i2eledge[el1edge][el1]=-1;  /* -1: broken */
+            i2eledge[el2edge][el2]=-1;  
+          }
+          else
+          { i2eledge[el1edge][el1]=1;   /* 1: intact  */ 
+            i2eledge[el2edge][el2]=1;
+        } }
+        
+        /* Calculation of stress multiplier (z) from damage coefficient (dmg) */
+        
+        if(iusehy==0) /* Loading curve = unloading curve (classic formulation of Y-code) */
+        { z=(R1-((dpefa+dpefb-R1)/(dpefa+dpefb))*exp(dmg*(dpefa+dpefc*dpefb)/((dpefa+dpefb)*(R1-dpefa-dpefb))))*(dpefa*(R1-dmg)+dpefb*pow((R1-dmg),dpefc));
+        }
+        else /* Hysteretic model with linear unloading */
+        { if((integ==0) && (dmg>=d2eldmg[0][ielem])) /* Loading for integration point 0 */
+          { d2eldmg[0][ielem]=dmg;
+            z=(R1-((dpefa+dpefb-R1)/(dpefa+dpefb))*exp(d2eldmg[0][ielem]*(dpefa+dpefc*dpefb)/((dpefa+dpefb)*(R1-dpefa-dpefb))))*(dpefa*(R1-d2eldmg[0][ielem])+dpefb*pow((R1-d2eldmg[0][ielem]),dpefc));
+          }
+          else if((integ==1) && (dmg>=d2eldmg[1][ielem])) /* Loading for integration point 1 */
+          { d2eldmg[1][ielem]=dmg;
+            z=(R1-((dpefa+dpefb-R1)/(dpefa+dpefb))*exp(d2eldmg[1][ielem]*(dpefa+dpefc*dpefb)/((dpefa+dpefb)*(R1-dpefa-dpefb))))*(dpefa*(R1-d2eldmg[1][ielem])+dpefb*pow((R1-d2eldmg[1][ielem]),dpefc));
+          }
+          else if((integ==2) && (dmg>=d2eldmg[2][ielem]))  /* Loading for integration point 2 */
+          { d2eldmg[2][ielem]=dmg;
+            z=(R1-((dpefa+dpefb-R1)/(dpefa+dpefb))*exp(d2eldmg[2][ielem]*(dpefa+dpefc*dpefb)/((dpefa+dpefb)*(R1-dpefa-dpefb))))*(dpefa*(R1-d2eldmg[2][ielem])+dpefb*pow((R1-d2eldmg[2][ielem]),dpefc));
+          }
+          if((integ==0) && (dmg<d2eldmg[0][ielem])) /* Unloading for integration point 0 */
+          {  z=(R1-((dpefa+dpefb-R1)/(dpefa+dpefb))*exp(d2eldmg[0][ielem]*(dpefa+dpefc*dpefb)/((dpefa+dpefb)*(R1-dpefa-dpefb))))*(dpefa*(R1-d2eldmg[0][ielem])+dpefb*pow((R1-d2eldmg[0][ielem]),dpefc));
+             z=((op+dmg*ot)/(op+d2eldmg[0][ielem]*ot))*z;
+          }
+          else if((integ==1) && (dmg<d2eldmg[1][ielem])) /* Unloading for integration point 1 */
+          {  z=(R1-((dpefa+dpefb-R1)/(dpefa+dpefb))*exp(d2eldmg[1][ielem]*(dpefa+dpefc*dpefb)/((dpefa+dpefb)*(R1-dpefa-dpefb))))*(dpefa*(R1-d2eldmg[1][ielem])+dpefb*pow((R1-d2eldmg[1][ielem]),dpefc));
+             z=((op+dmg*ot)/(op+d2eldmg[1][ielem]*ot))*z;
+          }
+          else if((integ==2) && (dmg<d2eldmg[2][ielem])) /* Unloading for integration point 2 */
+          {  z=(R1-((dpefa+dpefb-R1)/(dpefa+dpefb))*exp(d2eldmg[2][ielem]*(dpefa+dpefc*dpefb)/((dpefa+dpefb)*(R1-dpefa-dpefb))))*(dpefa*(R1-d2eldmg[2][ielem])+dpefb*pow((R1-d2eldmg[2][ielem]),dpefc));
+             z=((op+dmg*ot)/(op+d2eldmg[2][ielem]*ot))*z;
+          }
+        }  
+  
+        if(o<R0)           /* normal stress */
+        { sigma=R2*o*dpeft/op; /* sigma=R0; */
+        }
+        else if(o>op)
+        { sigma=dpeft*z; nsoft=nsoft+1;
+        }
+        else
+        { sigma=(R2*o/op-(o/op)*(o/op))*z*dpeft;
+        }
+        /* take into account Mohr-Coulomb   */
+        if(dpeco>R0)
+        { if(sigma>R0)
+          { 
+            if(dusaf>0) //! Anisotropic fracture model
+            { 
+              C = dusaf;
+              dpefs = dpecor + (dpeco-dpecor) * pow((gamma/90.0),C); 
+            }
+            else
+            { 
+              dpefs = dpeco; 
+            }
+            //! Use "cohesive" DFN properties if joint element belongs to DFN
+            //if((iusefn == 2)&&(i1edfnf[ielem]==1))
+            if(((iusefn == 2)&&(i1edfnf[ielem]==1))||((iusefn == 3) && (i1edft[ielem] == 2)))
+            { dpefs = ddfnco; }
+          }
+          else
+          { 
+            if(dusaf>0) //! Anisotropic fracture model
+            { 
+              C = dusaf; 
+              dpefs = dpecor + (dpeco-dpecor) * pow((gamma/90.0),C) - sigma * (dpefrrd + (dpefr - dpefrrd) * pow((gamma/90.0),C));               
+            }
+            else
+            { 
+              dpefs = dpeco-sigma*dpefr; 
+            }
+            //! Use "cohesive" DFN properties if joint element belongs to DFN
+            //if((iusefn == 2)&&(i1edfnf[ielem]==1))
+            if(((iusefn == 2)&&(i1edfnf[ielem]==1))||((iusefn == 3) && (i1edft[ielem] == 2)))
+            { dpefs = ddfnco-sigma*dpefr;}
+        } }
+        if((sigma>R0)&&(sabs>sp))           /* shear stress */
+        { tau=z*dpefs;
+        }
+        else if(sigma>R0)
+        { 
+           tau=R2*sabs*dpefs/sp;
+          //tau=(R2*(sabs/sp)-(sabs/sp)*(sabs/sp))*z*dpefs;
+        }
+        else if(sabs>sp)
+        { tau=z*dpefs-dpefm*sigma;
+        }
+        else
+        { tau=R2*sabs*dpefs/sp;
+          //tau=(R2*(sabs/sp)-(sabs/sp)*(sabs/sp))*(z*dpefs-dpefm*sigma);
+        }
+        d1elfs[ielem]=dpefs;    /* update fs to Mohr-Coulomb    */
+        if(s<R0)tau=-tau;
+        if(integ==0)  /* nodal forces */
+        { area=h/YR6; /* area=h/6.0; */
+          d1nfcx[i0]=d1nfcx[i0]-area*(tau*e1x-sigma*e1y);
+          d1nfcx[i3]=d1nfcx[i3]+area*(tau*e1x-sigma*e1y);
+          d1nfcy[i0]=d1nfcy[i0]-area*(tau*e1y+sigma*e1x);
+          d1nfcy[i3]=d1nfcy[i3]+area*(tau*e1y+sigma*e1x);
+          /* Element fracture energy */
+          d1efe[ielem]=d1efe[ielem]+dcstec*((-area*(tau*e1x-sigma*e1y))*d1nvcx[i0]+(-area*(tau*e1y+sigma*e1x))*d1nvcy[i0]+
+                        (area*(tau*e1x-sigma*e1y))*d1nvcx[i3]+(area*(tau*e1y+sigma*e1x))*d1nvcy[i3]);
+          
+          /*if(ielem==3)
+          { Fxi0=Fxi0-area*(tau*e1x-sigma*e1y);
+            Fyi0=Fyi0-area*(tau*e1y+sigma*e1x); }*/
+        }
+        else if(integ==1)
+        { area=h/R3;  /* area=h/3.0; */
+          d1nfcx[i0]=d1nfcx[i0]-area*(tau*e1x-sigma*e1y);
+          d1nfcx[i3]=d1nfcx[i3]+area*(tau*e1x-sigma*e1y);
+          d1nfcy[i0]=d1nfcy[i0]-area*(tau*e1y+sigma*e1x);
+          d1nfcy[i3]=d1nfcy[i3]+area*(tau*e1y+sigma*e1x);
+          d1nfcx[i1]=d1nfcx[i1]-area*(tau*e1x-sigma*e1y);
+          d1nfcx[i2]=d1nfcx[i2]+area*(tau*e1x-sigma*e1y);
+          d1nfcy[i1]=d1nfcy[i1]-area*(tau*e1y+sigma*e1x);
+          d1nfcy[i2]=d1nfcy[i2]+area*(tau*e1y+sigma*e1x);
+          /* Element fracture energy */
+          d1efe[ielem]=d1efe[ielem]+dcstec*((-area*(tau*e1x-sigma*e1y))*d1nvcx[i0]+(-area*(tau*e1y+sigma*e1x))*d1nvcy[i0]+
+                       (-area*(tau*e1x-sigma*e1y))*d1nvcx[i1]+(-area*(tau*e1y+sigma*e1x))*d1nvcy[i1]+
+                       (+area*(tau*e1x-sigma*e1y))*d1nvcx[i2]+(+area*(tau*e1y+sigma*e1x))*d1nvcy[i2]+
+                       (+area*(tau*e1x-sigma*e1y))*d1nvcx[i3]+(+area*(tau*e1y+sigma*e1x))*d1nvcy[i3]);
+
+          /*if(ielem==3)
+          { Fxi0=Fxi0-area*(tau*e1x-sigma*e1y);  
+            Fyi0=Fyi0-area*(tau*e1y+sigma*e1x); }*/
+          //if(ielem==3)
+          //{ fprintf(out1,"%.6f \t %.6f \t %.6f \n",dctime,sigma,tau); }
+        }
+        else
+        { area=h/YR6; /* area=h/6.0; */
+          d1nfcx[i1]=d1nfcx[i1]-area*(tau*e1x-sigma*e1y);
+          d1nfcx[i2]=d1nfcx[i2]+area*(tau*e1x-sigma*e1y);
+          d1nfcy[i1]=d1nfcy[i1]-area*(tau*e1y+sigma*e1x);
+          d1nfcy[i2]=d1nfcy[i2]+area*(tau*e1y+sigma*e1x);
+          /* Element fracture energy */
+          d1efe[ielem]=d1efe[ielem]+dcstec*((-area*(tau*e1x-sigma*e1y))*d1nvcx[i1]+(-area*(tau*e1y+sigma*e1x))*d1nvcy[i1]+
+                       (+area*(tau*e1x-sigma*e1y))*d1nvcx[i2]+(+area*(tau*e1y+sigma*e1x))*d1nvcy[i2]);
+        }
+      }
+      }
+      /* If joint is yielded compute differential kinetic energy */
+      if(i1esftf[ielem]>0)
+      { joint_ke = 0.5*(d1nmct[i0]*(d1nvcx[i0]*d1nvcx[i0]+d1nvcy[i0]*d1nvcy[i0])+
+                        d1nmct[i1]*(d1nvcx[i1]*d1nvcx[i1]+d1nvcy[i1]*d1nvcy[i1])+
+                        d1nmct[i2]*(d1nvcx[i2]*d1nvcx[i2]+d1nvcy[i2]*d1nvcy[i2])+
+                        d1nmct[i3]*(d1nvcx[i3]*d1nvcx[i3]+d1nvcy[i3]*d1nvcy[i3]));
+        delta_ke = joint_ke - d1eike[ielem];
+        /* If the differential kinetic energy is greater than that from previous timestep update the joint differential kin energy */
+        if(delta_ke > d1edke[ielem])
+        { d1edke[ielem] = delta_ke; 
+          d1etmke[ielem] = dctime;
+        }
+        if(iusesm == 1) //! Use maximum time window duration
+        { if (dctime >= d1etike[ielem] + dctwle)
+          { d1eike[ielem] = joint_ke;
+            d1etike[ielem] = dctime; 
+        } }
+      }
+      if(iusesm == 2) //! Record energy at the time of failure
+      { if(d1ebrkf[ielem]>0)
+        { joint_ke = 0.5*(d1nmct[i0]*(d1nvcx[i0]*d1nvcx[i0]+d1nvcy[i0]*d1nvcy[i0])+
+                          d1nmct[i1]*(d1nvcx[i1]*d1nvcx[i1]+d1nvcy[i1]*d1nvcy[i1])+
+                          d1nmct[i2]*(d1nvcx[i2]*d1nvcx[i2]+d1nvcy[i2]*d1nvcy[i2])+
+                          d1nmct[i3]*(d1nvcx[i3]*d1nvcx[i3]+d1nvcy[i3]*d1nvcy[i3]));
+          d1edke[ielem] = joint_ke;
+          d1etmke[ielem] = dctime;
+      } }
+    
+
+
+} 
+    }
+  }
+}
+
+
+
+
+
+
+
+/*********************PUBLIC*************************************/
+void Yfd(   ydc,  yde,  ydn, ydmn, ydo,  ydpe, ydpn, ydpj, ydis, ydfn, ydhf, ydsm, ydsb    /***  nodal forces  ***/
+        )
+  YDC ydc; YDE yde; YDN ydn;YDMN ydmn; YDO ydo; YDPE ydpe; YDPN ydpn; YDPJ ydpj; YDIS ydis; YDFN ydfn; YDHF ydhf; YDSM ydsm; YDSB ydsb;
+{ YINT iprop,inopo,jprop,i,j;
+  YINT ielem;
+  static YINT pmcstep=0; /* previous maximum number of time steps */
+  YINT ihys;
+  
+  YINT s,k,r;
+  DBL xi_0,yi_0,xi_1,yi_1;
+  
+  /* zero model strain energy */
+  for(ihys=0;ihys<ydo->nohys;ihys++)
+  { if(ydo->i1ohyt[ihys]==(YFLEE)) 
+    { ydo->d1ohys[ihys] = 0.0;
+    }
+  }
+    if (ydn->i1remeshf == INT1NULL)
+  { ydn->i1remeshf = TalINT1(ydn->mnopo);
+    for(i=0;i<ydn->mnopo;i++)
+    ydn->i1remeshf[i]=-1;
+  }
+
+ /* Initializing d1area */
+  if(yde->d1area==DBL1NULL)
+  { yde->d1area=TalDBL1(yde->melem);
+    for(i=0;i<yde->melem;i++)
+       yde->d1area[i]=R0;
+  }
+ /* Initializing d1area */
+  if(yde->d1inst==DBL1NULL)
+  { yde->d1inst=TalDBL1(yde->melem);
+    yde->d1inss=TalDBL1(yde->melem);
+
+    for(i=0;i<yde->melem;i++)
+       yde->d1inst[i]=1000000000000000000.0;
+       yde->d1inss[i]=1000000000000000000.0;
+  }
+
+  if(yde->d2dmg==DBL2NULL)
+  { yde->d2dmg=TalDBL2(3,yde->melem);
+    yde->d2D=TalDBL2(3,yde->melem);
+    for(i=0;i<3;i++)
+    { for(j=0;j<yde->melem;j++)
+        yde->d2dmg[i][j]=R0;
+        yde->d2D[i][j]=R0;
+    }
+  }
+
+
+    /* init. shear strength from joint database */
+  if(ydc->ncstep==0 || ydc->ncstep==pmcstep)
+  { pmcstep=ydc->mcstep;
+    if(ydpj->npjset>0)
+    { yde->d1elfs=TalDBL1(yde->melem);
+      for(ielem=0;ielem<yde->melem;ielem++)
+      { if(yde->i1elpr[ielem]>=ydpe->nprop)  /* joints   */
+        { jprop=yde->i1elpr[ielem]-ydpe->nprop;
+          if((ydpj->i1ptyp[jprop])==(YTE2JOINTS))
+          { if(ydpj->d1pjfs[jprop]>R0)
+            { yde->d1elfs[ielem]=ydpj->d1pjfs[jprop];
+            }
+            else
+            { yde->d1elfs[ielem]=ydpj->d1pjco[jprop];  
+        } } }
+        else                                /* trians   */
+        { iprop=yde->i1elpr[ielem];
+	  // This part has to be commented out (still to figure out why :-)
+	  /*if((ydpe->i1ptyp[iprop])==(YTE2TRISOF))
+          { yde->d1elfs[ielem]=ydpj->d1pjfs[ydpe->i1pejp[iprop]];
+          } */
+  } } } }
+  /* zero nodal forces and masses */
+  for(inopo=0;inopo<ydn->nnopo;inopo++)
+  { ydn->d1nmct[inopo]=R0;
+    if(ydn->nnodim>0)ydn->d2nfc[0][inopo]=R0;
+    if(ydn->nnodim>1)ydn->d2nfc[1][inopo]=R0;
+    if(ydn->nnodim>2)ydn->d2nfc[2][inopo]=R0;
+  }
+  /* zero number of joint elements broken in the timestep */
+  yde->netbrk=0;
+  /* zero number of joint elements softened in the timestep */
+  yde->netsft=0;
+  /* Initializing i1ebrk */
+  if(yde->i1ebrk == INT1NULL)
+  { yde->i1ebrk=TalINT1(yde->melem);
+    for (i=0;i<yde->melem;i++)
+	{ yde->i1ebrk[i]=-1;
+    }
+  }
+  /* Initializing i1esft */
+  if(yde->i1esft == INT1NULL)
+  { yde->i1esft=TalINT1(yde->melem);
+    for (i=0;i<yde->melem;i++)
+	{ yde->i1esft[i]=-1;
+    }
+  }
+  /* Initializing d2ecbrk */
+  if(yde->d2ecbrk==DBL2NULL)
+  { yde->d2ecbrk=TalDBL2(ydn->mnodim,yde->melem);
+    for(i=0;i<ydn->mnodim;i++)
+    { for(j=0;j<yde->melem;j++)
+        yde->d2ecbrk[i][j]=R0;
+    }
+  }
+  /* Initializing d2ecbrk_NEW */
+  if(yde->d2ecbrk_NEW==DBL2NULL)
+  { yde->d2ecbrk_NEW=TalDBL2(ydn->mnodim,yde->melem);
+    for(i=0;i<ydn->mnodim;i++)
+    { for(j=0;j<yde->melem;j++)
+        yde->d2ecbrk_NEW[i][j]=R0;
+    }
+  }
+  /* Initializing d2ecsft */
+  if(yde->d2ecsft==DBL2NULL)
+  { yde->d2ecsft=TalDBL2(ydn->mnodim,yde->melem);
+    for(i=0;i<ydn->mnodim;i++)
+    { for(j=0;j<yde->melem;j++)
+        yde->d2ecsft[i][j]=R0;
+    }
+  }
+  /* initializing d1etbrk */
+  if(yde->d1etbrk==DBL1NULL)
+  { yde->d1etbrk=TalDBL1(yde->melem);
+    for(i=0;i<yde->melem;i++)
+      yde->d1etbrk[i]=R0;
+  }
+  /* initializing d1etsft */
+  if(yde->d1etsft==DBL1NULL)
+  { yde->d1etsft=TalDBL1(yde->melem);
+    for(i=0;i<yde->melem;i++)
+      yde->d1etsft[i]=R0;
+  }
+  /* initializing d1etmke */
+  if(yde->d1etmke==DBL1NULL)
+  { yde->d1etmke=TalDBL1(yde->melem);
+    for(i=0;i<yde->melem;i++)
+      yde->d1etmke[i]=R0;
+  }
+  /* initializing d1elbrk */
+  if(yde->d1elbrk==DBL1NULL)
+  { yde->d1elbrk=TalDBL1(yde->melem);
+    for(i=0;i<yde->melem;i++)
+      yde->d1elbrk[i]=R0;
+  }
+  /* Initializing d1efe */
+  if(yde->d1efe==DBL1NULL)
+  { yde->d1efe=TalDBL1(yde->melem);
+    for(i=0;i<yde->melem;i++)
+	  yde->d1efe[i]=R0;
+  }
+  /* Initializing d1esftf */
+  if(yde->i1esftf==INT1NULL)
+  { yde->i1esftf=TalINT1(yde->melem);
+    for(i=0;i<yde->melem;i++)
+	  yde->i1esftf[i]=0;
+  }
+  /* Initializing d1ebrkf */
+  if(yde->d1ebrkf==DBL1NULL)
+  { yde->d1ebrkf=TalDBL1(yde->melem);
+    for(i=0;i<yde->melem;i++)
+	  yde->d1ebrkf[i]=R0;
+  }
+  /* Initializing d1eike */
+  if(yde->d1eike==DBL1NULL)
+  { yde->d1eike=TalDBL1(yde->melem);
+    for(i=0;i<yde->melem;i++)
+       yde->d1eike[i]=R0;
+  }
+  /* Initializing d1edke */
+  if(yde->d1edke==DBL1NULL)
+  { yde->d1edke=TalDBL1(yde->melem);
+    for(i=0;i<yde->melem;i++)
+       yde->d1edke[i]=R0;
+  }
+  /* Initializing d1etike */
+  if(yde->d1etike==DBL1NULL)
+  { yde->d1etike=TalDBL1(yde->melem);
+    for(i=0;i<yde->melem;i++)
+       yde->d1etike[i]=R0;
+  }
+
+  /* Initializing i1psup */
+  if(ydpe->i1psup==INT1NULL)
+  { ydpe->i1psup=TalINT1(ydpe->mprop);
+    for (i=0;i<ydpe->mprop;i++)
+    { yde->i1ebrk[i]=0; }
+  }
+  
+//   /* Initializing i1pjhy with 0 if not specified in the input file */
+//   if(ydpj->i1pjhy==INT1NULL)
+//   { ydpj->i1pjhy=TalINT1(ydpj->mpjset);
+//     for (i=0;i<ydpj->mpjset;i++)
+//     { ydpj->i1pjhy[i]=0; }
+//   }
+  
+
+  /* Initializing d2eldmg only if hysteretic joint model is used */
+  if(ydpj->iusehy>0)
+  { if(yde->d2eldmg==DBL2NULL)
+    { yde->d2eldmg=TalDBL2(3,yde->melem);
+      for(i=0;i<3;i++)
+      { for(j=0;j<yde->melem;j++)
+        yde->d2eldmg[i][j]=R0;
+      }
+    }
+  }
+  
+  /* Initializing d2elstr only if rebars are used */
+  if(ydsb->nsbar>0)
+  { if(yde->d2elstr==DBL2NULL)
+    { yde->d2elstr=TalDBL2(4,yde->melem);
+      for(i=0;i<4;i++)
+      { for(j=0;j<yde->melem;j++)
+        yde->d2elstr[i][j]=R0;
+      }
+    }
+  }
+  
+  /* Initializing d2nc0 (current coordinates at timestep 0, used to output displacements */
+  if(ydn->d2nc0==DBL2NULL)
+  { ydn->d2nc0=TalDBL2(4,ydn->mnopo);
+    for(i=0;i<2;i++)
+    { for(j=0;j<ydn->mnopo;j++)
+      ydn->d2nc0[i][j]=ydn->d2ncc[i][j];
+    }
+  }
+    
+
+
+
+
+
+
+/* --- 初始化显式塑性 + 扩展次载面（DP版）状态量，只在 ncstep==0 时执行 --- */
+if (ydc->ncstep == 0) {
+
+  /* 塑性形变梯度 Fp */
+  if (yde->Fp00 == DBL2NULL) {
+    yde->Fe00 = TalDBL2(NINT, yde->melem);
+    yde->Fe01 = TalDBL2(NINT, yde->melem);
+    yde->Fe10 = TalDBL2(NINT, yde->melem);
+    yde->Fe11 = TalDBL2(NINT, yde->melem);
+    yde->Fe33 = TalDBL2(NINT, yde->melem);
+
+    
+    
+    yde->Fp00 = TalDBL2(NINT, yde->melem);
+    yde->Fp01 = TalDBL2(NINT, yde->melem);
+    yde->Fp10 = TalDBL2(NINT, yde->melem);
+    yde->Fp11 = TalDBL2(NINT, yde->melem);
+    yde->Fp33 = TalDBL2(NINT, yde->melem);
+
+    yde->sigma00 = TalDBL2(NINT, yde->melem);
+    yde->sigma10 = TalDBL2(NINT, yde->melem);
+    yde->sigma11 = TalDBL2(NINT, yde->melem);
+    yde->sigma33 = TalDBL2(NINT, yde->melem);
+
+    yde->ss00 = TalDBL2(NINT, yde->melem);
+    yde->ss01 = TalDBL2(NINT, yde->melem);
+    yde->ss10 = TalDBL2(NINT, yde->melem);
+    yde->ss11 = TalDBL2(NINT, yde->melem);
+    yde->ss33 = TalDBL2(NINT, yde->melem);
+
+    for (i = 0; i < NINT; i++)
+      for (ielem = 0; ielem < yde->melem; ielem++) {
+        yde->Fp00[i][ielem] = 1.0;
+        yde->Fp01[i][ielem] = 0.0;
+        yde->Fp10[i][ielem] = 0.0;
+        yde->Fp11[i][ielem] = 1.0;
+        yde->Fp33[i][ielem] = 1.0; 
+        
+        
+        
+        yde->Fe00[i][ielem] = 1.0;
+        yde->Fe01[i][ielem] = 0.0;
+        yde->Fe10[i][ielem] = 0.0;
+        yde->Fe11[i][ielem] = 1.0;
+        yde->Fe33[i][ielem] = 1.0;
+
+        yde->sigma00[i][ielem] = 0.0;
+        yde->sigma10[i][ielem] = 0.0;
+        yde->sigma11[i][ielem] = 0.0;
+        yde->sigma33[i][ielem] = 0.0;
+        yde->ss00[i][ielem] = 0.0;
+        yde->ss01[i][ielem] = 0.0;
+        yde->ss10[i][ielem] = 0.0;
+        yde->ss11[i][ielem] = 0.0;
+        yde->ss33[i][ielem] = 0.0;
+      }
+  }
+
+
+
+
+  /* 动硬化耗散分量 Fpkd */
+  if (yde->Fpkd00 == DBL2NULL) {
+    yde->Fpkd00 = TalDBL2(NINT, yde->melem);
+    yde->Fpkd01 = TalDBL2(NINT, yde->melem);
+    yde->Fpkd10 = TalDBL2(NINT, yde->melem);
+    yde->Fpkd11 = TalDBL2(NINT, yde->melem);
+    yde->Fpkd33 = TalDBL2(NINT, yde->melem);
+    for (i = 0; i < NINT; i++)
+      for (ielem = 0; ielem < yde->melem; ielem++) {
+        yde->Fpkd00[i][ielem] = 1.0;
+        yde->Fpkd01[i][ielem] = 0.0;
+        yde->Fpkd10[i][ielem] = 0.0;
+        yde->Fpkd11[i][ielem] = 1.0;
+        yde->Fpkd33[i][ielem] = 1.0;
+      }
+  }
+
+  /* 弹性核耗散分量 Fpcd */
+  if (yde->Fpcd00 == DBL2NULL) {
+    yde->Fpcd00 = TalDBL2(NINT, yde->melem);
+    yde->Fpcd01 = TalDBL2(NINT, yde->melem);
+    yde->Fpcd10 = TalDBL2(NINT, yde->melem);
+    yde->Fpcd11 = TalDBL2(NINT, yde->melem);
+    yde->Fpcd33 = TalDBL2(NINT, yde->melem);
+    for (i = 0; i < NINT; i++)
+      for (ielem = 0; ielem < yde->melem; ielem++) {
+        yde->Fpcd00[i][ielem] = 1.0;
+        yde->Fpcd01[i][ielem] = 0.0;
+        yde->Fpcd10[i][ielem] = 0.0;
+        yde->Fpcd11[i][ielem] = 1.0;
+        yde->Fpcd33[i][ielem] = 1.0;
+      }
+  }
+
+
+  /* Mk / Mc （Mandel-like 背应力与弹性核中心） */
+  if (yde->Mk00 == DBL2NULL) {
+    yde->Mk00 = TalDBL2(NINT, yde->melem);
+    yde->Mk01 = TalDBL2(NINT, yde->melem);
+    yde->Mk11 = TalDBL2(NINT, yde->melem);
+    yde->Mk33 = TalDBL2(NINT, yde->melem);
+
+
+    yde->Mc00 = TalDBL2(NINT, yde->melem);
+    yde->Mc01 = TalDBL2(NINT, yde->melem);
+    yde->Mc11 = TalDBL2(NINT, yde->melem);
+    yde->Mc33 = TalDBL2(NINT, yde->melem);
+    
+    
+    
+    yde->M00 = TalDBL2(NINT, yde->melem);
+    yde->M01 = TalDBL2(NINT, yde->melem);
+    yde->M10 = TalDBL2(NINT, yde->melem);
+    yde->M11 = TalDBL2(NINT, yde->melem);
+    yde->M33 = TalDBL2(NINT, yde->melem);
+
+
+
+
+
+
+    for (i = 0; i < NINT; i++)
+      for (ielem = 0; ielem < yde->melem; ielem++) {
+        yde->Mk00[i][ielem] = 0.0;
+        yde->Mk01[i][ielem] = 0.0;
+        yde->Mk11[i][ielem] = 0.0;
+        yde->Mk33[i][ielem] = 0.0;
+
+
+        yde->Mc00[i][ielem] = 0.0;
+        yde->Mc01[i][ielem] = 0.0;
+        yde->Mc11[i][ielem] = 0.0;
+        yde->Mc33[i][ielem] = 0.0;
+
+
+
+
+        yde->M00[i][ielem] = 0.0;
+        yde->M01[i][ielem] = 0.0;
+        yde->M10[i][ielem] = 0.0;
+        yde->M11[i][ielem] = 0.0; 
+        yde->M33[i][ielem] = 0.0;
+
+      }
+  }
+
+  /* 硬化标量 H / R / Rc */
+
+  if (yde->H == DBL2NULL) {
+    yde->H  = TalDBL2(NINT, yde->melem);
+    yde->R  = TalDBL2(NINT, yde->melem);
+    yde->Rc = TalDBL2(NINT, yde->melem);
+    yde->EPS= TalDBL2(NINT, yde->melem);
+    for (i=0; i<NINT; i++)
+      for (ielem=0; ielem<yde->melem; ielem++) {
+        yde->H[i][ielem]  = 0.0;
+        yde->R[i][ielem]  = 0.0; /* 或材料参数 Re 初值 */
+        yde->Rc[i][ielem] = 0.0;
+        yde->EPS[i][ielem]= 0.0;
+      }
+  }
+
+  /* 可选诊断 detFp / eqp */
+
+  if (yde->detFe == DBL2NULL) {
+    yde->detFe = TalDBL2(NINT, yde->melem);
+    yde->detFp = TalDBL2(NINT, yde->melem);
+    yde->eqp   = TalDBL2(NINT, yde->melem);
+    for (i = 0; i < NINT; i++) {
+        for (ielem = 0; ielem < yde->melem; ielem++) {
+            yde->detFe[i][ielem] = 1.0;  /* 初始 Fe 行列式 */
+            yde->detFp[i][ielem] = 1.0;  /* 初始 Fp 行列式 */
+            yde->eqp[i][ielem]   = 0.0;  /* 初始等效塑性应变 */
+        }
+    }
+}
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  /* At time step zero, if a mixed DFN type is used, find and assign crack type to all joint elements belonging to the DFN */
+  if(ydc->ncstep == 0) 
+  { if(ydfn->iusefn == 3)
+    { for(jprop=0;jprop<ydpj->npjset;jprop++) // Loop over joint elements
+      { if((ydpj->i1ptyp[jprop])==(YTE2JOINTS))
+        { for(ielem=0;ielem<yde->nelem;ielem++)
+          { if(yde->i1elpr[ielem]==(jprop+(ydpe->nprop)))
+            // Check if two edge nodes (of the joint element) belong to a DFN crack
+       	    { xi_0 = ydn->d2nci[0][yde->i2elto[0][ielem]];  
+      	      yi_0 = ydn->d2nci[1][yde->i2elto[0][ielem]];                
+	      xi_1 = ydn->d2nci[0][yde->i2elto[1][ielem]];
+	      yi_1 = ydn->d2nci[1][yde->i2elto[1][ielem]];
+	      for(s=0; s<ydfn->mdfnfr; s++)
+	      { for(k=0; k<ydfn->mdfnno; k++)
+	        { if(ydfn->i2dfnn[k][s] >= 0)  
+	          { if(xi_0 == ydn->d2nci[0][ydfn->i2dfnn[k][s]])
+	            { if(yi_0 == ydn->d2nci[1][ydfn->i2dfnn[k][s]])
+	              { for(r=0; r<ydfn->mdfnno; r++)
+	                { if(ydfn->i2dfnn[r][s] >= 0)
+		          { if(xi_1 == ydn->d2nci[0][ydfn->i2dfnn[r][s]])
+	                    { if(yi_1 == ydn->d2nci[1][ydfn->i2dfnn[r][s]]) 
+	                      { yde->i1edft[ielem] = ydfn->i1dfft[s]; //! Assign crack type to joint element (1 = broken, 2 = cohesive)
+  } } } } } } } } } } } } } } }
+  
+  
+   
+  /* Apply support */
+  for(iprop=0;iprop<ydpe->nprop;iprop++)
+  { if(ydpe->i1psup[iprop]==1)
+    { for(ielem=0;ielem<yde->nelem;ielem++)
+      { if(yde->i1elpr[ielem]==iprop) //! Set initial coordinates equal to current coordinates (i.e., reset elastic deformation)
+        { ydn->d2nci[0][(yde->i2elto[0][ielem])]=ydn->d2ncc[0][(yde->i2elto[0][ielem])];
+          ydn->d2nci[0][(yde->i2elto[1][ielem])]=ydn->d2ncc[0][(yde->i2elto[1][ielem])];
+          ydn->d2nci[0][(yde->i2elto[2][ielem])]=ydn->d2ncc[0][(yde->i2elto[2][ielem])];
+          ydn->d2nci[1][(yde->i2elto[0][ielem])]=ydn->d2ncc[1][(yde->i2elto[0][ielem])];
+          ydn->d2nci[1][(yde->i2elto[1][ielem])]=ydn->d2ncc[1][(yde->i2elto[1][ielem])];
+          ydn->d2nci[1][(yde->i2elto[2][ielem])]=ydn->d2ncc[1][(yde->i2elto[2][ielem])];
+      } } 
+      ydpe->i1psup[iprop]=0;
+   } }
+   
+  for(iprop=0;iprop<ydpe->nprop;iprop++)
+  { if( 
+        (ydpe->i1ptyp[iprop])==(YTE2PLANESTRAIN) )
+    { 
+
+  /*
+Yfd2TRIELS(   
+      yde->nelem,
+      iprop,
+      ydpn->npnfact,ydpn->mpnset,ydpn->npnset,
+      ydpn->d3pnfac,
+      ydpe->i1ptyp[iprop],
+      ydpe->d1peks[iprop],ydpe->d1pela[iprop],
+      ydpe->d1pemu[iprop],ydpe->d1pero[iprop],ydpe->d1psem[iprop],
+      ydpe->d1peem[iprop],ydpe->d1penu[iprop],
+      ydn->d2ncc[0],ydn->d2ncc[1],ydn->d2nci[0],ydn->d2nci[1],ydn->d2nfc[0],
+      ydn->d2nfc[1],ydn->d1nmct  ,ydn->d2nvc[0],ydn->d2nvc[1],
+      ydpn->d1pnaf , ydpn->d1pnap  ,ydpn->d1pnat  ,
+      yde->i1elpr,ydn->i1nopr,yde->i2elto,
+      ydo->nohys, ydo->dohyp , ydc->dctime,
+      ydo->d1ohys, ydo->d1ohyt, ydo->d1ohyx, ydo->d1ohyy,
+      ydo->i1ohyt, ydpn->npnset,yde->d1elfr,
+      ydpe->i1usan[iprop], ydpe->d1peex[iprop], ydpe->d1peey[iprop],
+      ydpe->d1pemx[iprop], ydpe->d1pemy[iprop], ydpe->d1peg[iprop],
+      ydis->iuseis, ydis->dcstxx, ydis->dcstxy, ydis->dcstyy,
+      ydis->dcsyxx, ydis->dcsyxy, ydis->dcsyyy, ydis->dcsrfy,
+      ydpn->i1pnfx, ydpn->i1pnfy,
+      ydpe->i1pexc, ydn->i1nowe, ydhf->iusehf,
+      ydsb->nsbar,yde->d2elstr,ydc->ncstep,
+yde->sigma00, yde->sigma10, yde->sigma11, yde->sigma33,yde->d1area,ydc->dcstec,
+yde->Fe00, yde->Fe01, yde->Fe10, yde->Fe11,yde->Fe33
+      );
+
+     */
+
+  
+   //  /*
+      Yfd2TRIELS_EP(
+    yde->nelem,
+    iprop,
+    ydpn->npnfact, ydpn->mpnset, ydpn->npnset,
+    ydpn->d3pnfac,
+    ydpe->i1ptyp[iprop],
+    ydpe->d1peks[iprop], ydpe->d1pela[iprop],
+    ydpe->d1pemu[iprop], ydpe->d1pero[iprop], ydpe->d1psem[iprop],
+    ydpe->d1peem[iprop], ydpe->d1penu[iprop],
+    ydn->d2ncc[0], ydn->d2ncc[1], ydn->d2nci[0], ydn->d2nci[1],
+    ydn->d2nfc[0], ydn->d2nfc[1], ydn->d1nmct,
+    ydn->d2nvc[0], ydn->d2nvc[1],
+    ydpn->d1pnaf, ydpn->d1pnap, ydpn->d1pnat,
+    yde->i1elpr, ydn->i1nopr, yde->i2elto,
+    ydo->nohys, ydo->dohyp, ydc->dctime,ydc->dcstec,
+    ydo->d1ohys, ydo->d1ohyt, ydo->d1ohyx, ydo->d1ohyy,
+    ydo->i1ohyt, ydpn->npnset, yde->d1elfr,
+    ydpe->i1usan[iprop], ydpe->d1peex[iprop], ydpe->d1peey[iprop],
+    ydpe->d1pemx[iprop], ydpe->d1pemy[iprop], ydpe->d1peg[iprop],
+    ydis->iuseis, ydis->dcstxx, ydis->dcstxy, ydis->dcstyy,
+    ydis->dcsyxx, ydis->dcsyxy, ydis->dcsyyy, ydis->dcsrfy,
+    ydpn->i1pnfx, ydpn->i1pnfy,
+    ydpe->i1pexc, ydn->i1nowe, ydhf->iusehf,
+    ydsb->nsbar, yde->d2elstr,
+    ydpe->d1phi[iprop], ydpe->d1DPc[iprop], ydpe->d1sig_t[iprop],
+ydpe->d1F0[iprop], ydpe->d1h1[iprop], ydpe->d1h2[iprop], ydpe->d1Hc[iprop],
+ydpe->d1Ck[iprop], ydpe->d1Cc[iprop],
+ydpe->d1bk[iprop], 
+ydpe->d1URu[iprop], ydpe->d1uc[iprop], ydpe->d1Re[iprop], ydpe->d1Chi[iprop],
+ydpe->d1nP[iprop], ydpe->d1n2[iprop],ydpe->d1nn[iprop],
+ydpe->i1use_ext_subloading[iprop], ydpe->i1use_kinhard[iprop],  
+    yde->Fe00, yde->Fe01, yde->Fe10, yde->Fe11,yde->Fe33,
+    yde->Fp00, yde->Fp01, yde->Fp10, yde->Fp11,yde->Fp33,
+    yde->Fpkd00, yde->Fpkd01, yde->Fpkd10, yde->Fpkd11,yde->Fpkd33,
+    yde->Fpcd00, yde->Fpcd01, yde->Fpcd10, yde->Fpcd11,yde->Fpcd33,
+    yde->M00, yde->M01, yde->M10, yde->M11,yde->M33,
+    yde->Mk00, yde->Mk01,  yde->Mk11,yde->Mk33,
+    yde->Mc00, yde->Mc01,  yde->Mc11,yde->Mc33,
+
+
+    yde->H, yde->R, yde->Rc,
+    yde->detFp, yde->eqp,yde->EPS,ydc->ncstep,
+yde->sigma00, yde->sigma10, yde->sigma11, yde->sigma33,yde->d1area,
+yde->ss00, yde->ss01, yde->ss10, yde->ss11, yde->ss33
+
+);
+
+  //  */
+
+
+    }
+    else if((ydpe->i1ptyp[iprop])==(YTE2TRISOF))
+    { Yfd2TRIELS(   /* small strain elastic triangle  */
+      yde->nelem,
+      iprop,
+      ydpn->npnfact,ydpn->mpnset,ydpn->npnset,
+      ydpn->d3pnfac,
+      ydpe->i1ptyp[iprop],
+      ydpe->d1peks[iprop],ydpe->d1pela[iprop],
+      ydpe->d1pemu[iprop],ydpe->d1pero[iprop],ydpe->d1psem[iprop],
+      ydpe->d1peem[iprop],ydpe->d1penu[iprop],
+      ydn->d2ncc[0],ydn->d2ncc[1],ydn->d2nci[0],ydn->d2nci[1],ydn->d2nfc[0],
+      ydn->d2nfc[1],ydn->d1nmct  ,ydn->d2nvc[0],ydn->d2nvc[1],
+      ydpn->d1pnaf , ydpn->d1pnap  ,ydpn->d1pnat  ,
+      yde->i1elpr,ydn->i1nopr,yde->i2elto,
+      ydo->nohys, ydo->dohyp , ydc->dctime,
+      ydo->d1ohys, ydo->d1ohyt, ydo->d1ohyx, ydo->d1ohyy,
+      ydo->i1ohyt, ydpn->npnset,yde->d1elfr,
+      ydpe->i1usan[iprop], ydpe->d1peex[iprop], ydpe->d1peey[iprop],
+      ydpe->d1pemx[iprop], ydpe->d1pemy[iprop], ydpe->d1peg[iprop],
+      ydis->iuseis, ydis->dcstxx, ydis->dcstxy, ydis->dcstyy,
+      ydis->dcsyxx, ydis->dcsyxy, ydis->dcsyyy, ydis->dcsrfy,
+      ydpn->i1pnfx, ydpn->i1pnfy,
+      ydpe->i1pexc, ydn->i1nowe, ydhf->iusehf,
+      ydsb->nsbar,yde->d2elstr,ydc->ncstep,
+yde->sigma00, yde->sigma10, yde->sigma11, yde->sigma33
+      );
+
+
+    }
+  }
+  for(jprop=0;jprop<ydpj->npjset;jprop++)
+  { if((ydpj->i1ptyp[jprop])==(YTE2JOINTS))
+    { 
+      
+       if((ydc->iuseeczm)==1)
+    { 
+
+Yfd2JOINTS_ECZM(  /* joint element  */
+      yde->nelem,(jprop+ydpe->nprop),
+      ydpj->d1pjft[jprop], ydpj->d1pjgf[jprop], ydpj->d1pjgs[jprop],
+      ydpj->d1pjco[jprop], ydpj->d1pjfr[jprop], ydpj->d1pjpe[jprop],
+      ydn->d2ncc[0],ydn->d2ncc[1],ydn->d2nfc[0],ydn->d2nfc[1],
+      ydn->d2nvc[0],ydn->d2nvc[1],
+      yde->i1elpr,yde->i2elto,yde->d1elfs,ydc->dctime,ydc->dcstec,&(yde->nebrk),&(yde->netbrk),yde->i1ebrk,yde->d2ecbrk,yde->d2ecbrk_NEW,
+      yde->d1etbrk,yde->d1elbrk,yde->d1efe,&(yde->nesft),&(yde->netsft),yde->i1esft,yde->d2ecsft,
+      yde->d1etsft,yde->i1esftf,yde->d1ebrkf,yde->d1eike,yde->d1edke,ydn->d1nmct,yde->d1etmke,
+      yde->i2elnext,yde->i2eledge,
+      ydpe->i1pexc,
+      ydpj->d1usaf[jprop],ydpj->d1pjal[jprop],
+      ydpj->d1pjcr[jprop],ydpj->d1pjfd[jprop],ydpj->d1pjtr[jprop],ydpj->d1pjgr[jprop],ydpj->d1pjsr[jprop],ydn->i1nowe,ydn->i2noid,
+      ydfn->iusefn,yde->i1edfnf,ydfn->ddfnft,ydfn->ddfnco,ydfn->ddfngf,ydfn->ddfngs,ydhf->iusehf,
+      yde->i1edft,yde->d1etike,ydsm->iusesm,ydsm->dctwle,
+      ydpj->iusehy,yde->d2eldmg,   
+      yde->sigma00, yde->sigma10, yde->sigma11,yde->d1area,ydc->ncstep, yde->d1inst,yde->d1inss,     yde->i1elprtmp,yde->i1elfr,&(ydc->iuptrimesh),ydn->i1remeshf
+    );
+
+
+
+    }
+      else
+    {
+      
+      Yfd2JOINTS(  /* joint element  */
+      yde->nelem,(jprop+ydpe->nprop),
+      ydpj->d1pjft[jprop], ydpj->d1pjgf[jprop], ydpj->d1pjgs[jprop],
+      ydpj->d1pjco[jprop], ydpj->d1pjfr[jprop], ydpj->d1pjpe[jprop],
+      ydn->d2ncc[0],ydn->d2ncc[1],ydn->d2nfc[0],ydn->d2nfc[1],
+      ydn->d2nvc[0],ydn->d2nvc[1],
+      yde->i1elpr,yde->i2elto,yde->d1elfs,ydc->dctime,ydc->dcstec,&(yde->nebrk),&(yde->netbrk),yde->i1ebrk,yde->d2ecbrk,yde->d2ecbrk_NEW,
+      yde->d1etbrk,yde->d1elbrk,yde->d1efe,&(yde->nesft),&(yde->netsft),yde->i1esft,yde->d2ecsft,
+      yde->d1etsft,yde->i1esftf,yde->d1ebrkf,yde->d1eike,yde->d1edke,ydn->d1nmct,yde->d1etmke,
+      yde->i2elnext,yde->i2eledge,
+      ydpe->i1pexc,
+      ydpj->d1usaf[jprop],ydpj->d1pjal[jprop],
+      ydpj->d1pjcr[jprop],ydpj->d1pjfd[jprop],ydpj->d1pjtr[jprop],ydpj->d1pjgr[jprop],ydpj->d1pjsr[jprop],ydn->i1nowe,ydn->i2noid,
+      ydfn->iusefn,yde->i1edfnf,ydfn->ddfnft,ydfn->ddfnco,ydfn->ddfngf,ydfn->ddfngs,ydhf->iusehf,
+      yde->i1edft,yde->d1etike,ydsm->iusesm,ydsm->dctwle,
+      ydpj->iusehy,yde->d2eldmg,yde->EPS,yde->d2dmg,yde->d2D);
+
+
+
+
+  }
+
+    }
+  }
+}
+
